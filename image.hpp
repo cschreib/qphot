@@ -9,6 +9,7 @@ struct image_t {
     double aperture = dnan;
     bool clean_neighbors = false;
     bool noconvolve = false;
+    bool nodance = false;
     bool hri = false;
     std::string flux_method = "none";
 
@@ -22,8 +23,10 @@ struct image_t {
     vec2d psf;
     fits::header hdr;
     astro::wcs wcs;
+    astro::wcs psf_wcs;
     std::string regridded_data_cache;
     vec2d regridded_data;
+    vec2d regridded_data_noconvol;
     vec1u idf;
     vec1u idnf;
     vec2d regridded_psf;
@@ -35,14 +38,15 @@ struct image_t {
     double aspix = 0.0;
     double regridded_aspix = 0.0;
     double conv_radius = 0.0;
-    double conv_sqr = 1.0;
+    double noise_correl = 1.0;
     double flux = dnan, flux_err = dnan, apcor = dnan, background = dnan;
     vec1d flux_bg;
     uint_t num_bg = 0;
 
     // Helper functions
-    void regrid_data(const astro::wcs& det_wcs, const fits::header& det_hdr,
-        double det_aspix, bool reuse, const std::string& det_hash, const std::string& out_dir) {
+    void regrid_data(const astro::wcs& det_wcs, const astro::wcs& det_psf_wcs, const fits::header& det_hdr,
+        const fits::header& det_psf_hdr, double det_aspix, bool reuse, const std::string& det_hash,
+        const std::string& out_dir) {
 
         // See if we can reuse a cached image
         this->regridded_data_cache = out_dir+this->base_filename+"_regrid_cache.fits";
@@ -71,13 +75,23 @@ struct image_t {
             if (det_aspix < aspix) {
                 regrid_interpolate_params rp;
                 rp.conserve_flux = true;
+
+                // Estimate noise correlation resulting from regriding
+                if (rp.method == interpolation_method::linear) {
+                    // Empirically estimated with simulations
+                    noise_correl = 1.5*sqr(aspix/det_aspix) + 0.78*pow(aspix/det_aspix, -2.3);
+                } else if (rp.method == interpolation_method::nearest) {
+                    // 1 pixel -> n pixels with the same value, simple
+                    noise_correl = sqr(aspix/det_aspix);
+                }
+
                 this->regridded_data = regrid_interpolate(this->data, this->wcs, det_wcs, rp);
                 // Regrid the PSF as well
-                this->regridded_psf = regrid_interpolate(this->psf, this->wcs, det_wcs, rp);
+                this->regridded_psf = regrid_interpolate(this->psf, this->psf_wcs, det_psf_wcs, rp);
             } else {
                 this->regridded_data = regrid_drizzle(this->data, this->wcs, det_wcs);
                 // Regrid the PSF as well
-                this->regridded_psf = regrid_drizzle(this->psf, this->wcs, det_wcs);
+                this->regridded_psf = regrid_drizzle(this->psf, this->psf_wcs, det_psf_wcs);
             }
 
             this->regridded_psf[where(!is_finite(this->regridded_psf))] = 0;
@@ -95,12 +109,19 @@ struct image_t {
             oimg.write_keyword("CACHEID", cache_hash);
             oimg.reach_hdu(2);
             oimg.write(this->regridded_psf);
+            oimg.write_header(det_psf_hdr);
         }
 
         this->idf = where(is_finite(this->regridded_data));
         this->idnf = where(!is_finite(this->regridded_data));
 
         this->regridded_hdr = det_hdr;
+
+        if (this->hri) {
+            this->regridded_data_noconvol = this->regridded_data;
+        }
+
+        fits::setkey(regridded_hdr, "NCORR", noise_correl, "[noise correlation]");
     }
 
     void convolve_to(double new_seeing) {
@@ -112,7 +133,7 @@ struct image_t {
         double ky0 = regridded_data.dims[0]/2;
         double kx0 = regridded_data.dims[1]/2;
         vec2d kernel = gaussian_profile(regridded_data.dims, conv_radius, ky0, kx0);
-        conv_sqr = sqrt(total(sqr(kernel)));
+        noise_correl = sqrt(sqrt(noise_correl) + 1.0/total(sqr(kernel)));
 
         // Convolve image
         make_finite();
@@ -127,7 +148,7 @@ struct image_t {
         convolved = true;
 
         fits::setkey(regridded_hdr, "CONVOL", conv_radius, "[pixels]");
-        fits::setkey(regridded_hdr, "CONSQR", conv_sqr, "[noise correlation]");
+        fits::setkey(regridded_hdr, "NCORR", noise_correl, "[noise correlation]");
     }
 
     void fit_neighbors(linfit_batch_t<vec1d>& batch, const vec2d& models,
@@ -165,7 +186,7 @@ struct image_t {
             masked[idfit] = false;
             for (uint_t iy : range(yl1-yl0+1))
             for (uint_t ix : range(xl1-xl0+1)) {
-                if (!masked(iy+yl0,ix+xl0)) {
+                if (!masked.safe(iy+yl0,ix+xl0)) {
                     batch.fr.chi2 += sqr(timg.safe(iy+yl0,ix+xl0));
                 }
             }
@@ -187,6 +208,7 @@ bool read_image_list(const std::string& filename, vec<1,image_t>& imgs) {
     std::string line;
     std::ifstream file(filename);
     uint_t l = 0;
+    image_t* cimg = nullptr;
 
     while (std::getline(file, line)) {
         ++l;
@@ -195,27 +217,39 @@ bool read_image_list(const std::string& filename, vec<1,image_t>& imgs) {
 
         auto eqpos = line.find('=');
         if (eqpos == line.npos) {
-            image_t img;
+            std::string filename;
             if (line[0] == '/') {
-                img.filename = line;
+                filename = line;
             } else {
-                img.filename = idir+line;
+                filename = idir+line;
             }
-            img.base_filename = file::remove_extension(file::get_basename(img.filename));
-            imgs.push_back(std::move(img));
+
+            auto iter = std::find_if(imgs.begin(), imgs.end(), [&](const image_t& img) {
+                return img.filename == filename;
+            });
+
+            if (iter == imgs.end()) {
+                image_t img;
+                img.filename = filename;
+                img.base_filename = file::remove_extension(file::get_basename(img.filename));
+                imgs.push_back(std::move(img));
+                cimg = &imgs.back();
+            } else {
+                cimg = &*iter;
+            }
         } else {
             std::string key = trim(line.substr(0, eqpos));
             std::string val = trim(line.substr(eqpos+1));
             if (key == "band") {
-                imgs.back().band = val;
+                cimg->band = val;
             } else if (key == "seeing") {
-                if (!from_string(val, imgs.back().seeing)) {
+                if (!from_string(val, cimg->seeing)) {
                     write_error("could not read seeing value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;
                 }
             } else if (key == "zero_point") {
-                if (!from_string(val, imgs.back().zero_point)) {
+                if (!from_string(val, cimg->zero_point)) {
                     write_error("could not read zero point value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;
@@ -223,32 +257,38 @@ bool read_image_list(const std::string& filename, vec<1,image_t>& imgs) {
             } else if (key == "psf") {
                 if (!val.empty()) {
                     if (val[0] == '/') {
-                        imgs.back().psffile = val;
+                        cimg->psffile = val;
                     } else {
-                        imgs.back().psffile = idir+val;
+                        cimg->psffile = idir+val;
                     }
                 }
             } else if (key == "aperture") {
-                if (!from_string(val, imgs.back().aperture)) {
+                if (!from_string(val, cimg->aperture)) {
                     write_error("could not read 'aperture' value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;
                 }
             } else if (key == "nodetect") {
-                if (!from_string(val, imgs.back().nodetect)) {
+                if (!from_string(val, cimg->nodetect)) {
                     write_error("could not read 'nodetect' value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;
                 }
             } else if (key == "clean_neighbors") {
-                if (!from_string(val, imgs.back().clean_neighbors)) {
+                if (!from_string(val, cimg->clean_neighbors)) {
                     write_error("could not read 'clean_neighbors' value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;
                 }
-            }else if (key == "noconvolve") {
-                if (!from_string(val, imgs.back().noconvolve)) {
+            } else if (key == "noconvolve") {
+                if (!from_string(val, cimg->noconvolve)) {
                     write_error("could not read 'noconvolve' value from '", val, "'");
+                    write_error("at ", filename, ":", l);
+                    return false;
+                }
+            } else if (key == "nodance") {
+                if (!from_string(val, cimg->nodance)) {
+                    write_error("could not read 'nodance' value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;
                 }
@@ -258,9 +298,9 @@ bool read_image_list(const std::string& filename, vec<1,image_t>& imgs) {
                     write_error("allowed values are: 'aper', 'none'");
                     return false;
                 }
-                imgs.back().flux_method = val;
+                cimg->flux_method = val;
             } else if (key == "hri") {
-                if (!from_string(val, imgs.back().hri)) {
+                if (!from_string(val, cimg->hri)) {
                     write_error("could not read 'hri' value from '", val, "'");
                     write_error("at ", filename, ":", l);
                     return false;

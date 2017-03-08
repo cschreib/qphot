@@ -14,3 +14,7 @@ include_directories(${PHYPP_INCLUDE_DIRS})
 add_executable(qphot qphot.cpp)
 target_link_libraries(qphot ${PHYPP_LIBRARIES})
 install(TARGETS qphot DESTINATION bin)
+
+add_executable(qphot-psfsub qphot-psfsub.cpp)
+target_link_libraries(qphot-psfsub ${PHYPP_LIBRARIES})
+install(TARGETS qphot-psfsub DESTINATION bin)

@@ -2,141 +2,19 @@
 #include "log.hpp"
 #include "image.hpp"
 #include "ds9.hpp"
-
-void get_background(const vec2d& data, double& bg, double& rms) {
-    vec1u idg;
-    idg = where(is_finite(data));
-    bg = median(data[idg]);
-    rms = 1.48*mad(data[idg]);
-
-    idg = where(is_finite(data) && data - bg < 10*rms);
-    bg = median(data[idg]);
-    rms = 1.48*mad(data[idg]);
-}
-
-void get_background_apertures(const vec2b& mask, double radius, vec1u& y, vec1u& x) {
-    y.clear();
-    x.clear();
-
-    // First segment the mask
-    uint_t nseg = 0;
-    vec2u seg = segment(mask, nseg);
-
-    // Add segments at the edges
-    seg(0,_) = seg(seg.dims[0]-1,_) = seg(_,0) = seg(_,seg.dims[1]-1) = nseg+1;
-
-    // Build distance from segments
-    vec2d dist;
-    vec2u dist_id;
-    segment_distance(seg, dist, dist_id);
-
-    // Now add circles on the largest distance point repeatedly until there is no
-    // space left
-    double radius2 = sqr(radius);
-    uint_t mid = max_id(dist);
-    while (dist[mid] >= radius2) {
-        vec1u muid = mult_ids(dist, mid);
-        y.push_back(muid[0]);
-        x.push_back(muid[1]);
-        dist[mid] = 0;
-        dist_id[mid] = mid;
-
-        std::vector<uint_t> oy = {muid[0]}, ox = {muid[1]};
-        while (!ox.empty()) {
-            auto toy = oy, tox = ox;
-            oy.clear(); ox.clear();
-
-            while (!tox.empty()) {
-                uint_t ty = toy.back(); toy.pop_back();
-                uint_t tx = tox.back(); tox.pop_back();
-
-                auto check_add = [&](uint_t tty, uint_t ttx) {
-                    if (dist.safe(tty,ttx) == 0) return;
-
-                    if (dist_id.safe(ty,tx) == mid) {
-                        double nd = sqr(double(tty) - y.back())
-                                  + sqr(double(ttx) - x.back());
-
-                        if (nd < radius2) {
-                            // Still within the circle, move on
-                            dist.safe(tty,ttx) = 0;
-                            dist_id.safe(tty,ttx) = mid;
-                            oy.push_back(tty);
-                            ox.push_back(ttx);
-                        } else {
-                            // Setup new origin and continue below
-                            dist_id.safe(ty,tx) = flat_id(dist, ty, tx);
-                        }
-                    }
-
-                    if (dist_id.safe(ty,tx) != mid) {
-                        double x0 = dist_id.safe(ty,tx) % dist_id.dims[1];
-                        double y0 = dist_id.safe(ty,tx) / dist_id.dims[1];
-                        double nd = sqr(double(tty) - y0) + sqr(double(ttx) - x0);
-                        if (dist.safe(tty,ttx) > nd) {
-                            dist.safe(tty,ttx) = nd;
-                            dist_id.safe(tty,ttx) = dist_id.safe(ty,tx);
-                            oy.push_back(tty);
-                            ox.push_back(ttx);
-                        }
-                    }
-                };
-
-                if (ty != 0)              check_add(ty-1,tx);
-                if (ty != dist.dims[0]-1) check_add(ty+1,tx);
-                if (tx != 0)              check_add(ty,tx-1);
-                if (tx != dist.dims[1]-1) check_add(ty,tx+1);
-            }
-        }
-
-        mid = max_id(dist);
-    }
-}
-
-// Measure the "seeing" (FWHM) from a PSF image
-double get_seeing(vec2d img, double y0, double x0) {
-    auto get_seeing_raw = [](const vec2d& timg, double ty0, double tx0) {
-        double tot = 0.0;
-        for (uint_t y : range(timg.dims[0]))
-        for (uint_t x : range(timg.dims[1])) {
-            tot += timg.safe(y,x)*(sqr(y - ty0) + sqr(x - tx0));
-        }
-
-        return sqrt(tot);
-    };
-
-    // Compute first estimate
-    img /= total(img); // image needs to be normalized first
-    double rr = get_seeing_raw(img, y0, x0);
-
-    // Simulate various profiles
-    vec1d td = rgen_step(0.1, max(img.dims[0], img.dims[1]), 0.3);
-    vec1d md(td.dims);
-
-    vec2d timg(img.dims);
-    for (uint_t i : range(td)) {
-        for (uint_t y : range(timg.dims[0]))
-        for (uint_t x : range(timg.dims[1])) {
-            timg.safe(y,x) = integrate_gauss_2d(y-0.5, y+0.5, x-0.5, x+0.5, y0, x0, td[i]);
-        }
-
-        md[i] = get_seeing_raw(timg, y0, x0);
-    }
-
-    // Correct measured value using simulation
-    // The additional factor of 2*sqrt(log(4.0)) is the conversion
-    // from a Gaussian sigma into a FWHM (=2.355)
-    return interpolate(td, md, rr)*2*sqrt(log(4.0));
-}
+#include "flux.hpp"
 
 int phypp_main(int argc, char* argv[]) {
     std::string outdir = "./";
+    std::string extra;
     bool verbose = false;
     double aperture = dnan; // [arcsec]
     std::string exclude;
     std::string include;
     double det_seeing = 0;
     uint_t det_min_area = 30;
+    double det_threshold = 0.5;
+    double bg_threshold = 2.0;
     std::string error_file;
     uint_t min_bg_aper = 10;
     bool no_neighbor_mask_background = false;
@@ -144,7 +22,8 @@ int phypp_main(int argc, char* argv[]) {
     std::string clean_model = "clean";
     double clean_ratio = 0.1;
     double clean_threshold = 3.0;
-    double clean_conv_seeing = 0.4;
+    double clean_conv_seeing = dnan;
+    double hri_min_snr = 5.0;
     bool save_models = false;
     bool debug_clean = false;
     bool clean_group = false;
@@ -157,7 +36,8 @@ int phypp_main(int argc, char* argv[]) {
         aperture, outdir, verbose, exclude, include, det_seeing, error_file, min_bg_aper,
         clean_model, reuse, clean_ratio, clean_threshold, clean_conv_seeing, clean_group,
         model_dance, dance_step, dance_max, dance_chi2_range, det_min_area, debug_clean,
-        no_neighbor_mask_background, save_models
+        no_neighbor_mask_background, save_models, det_threshold, bg_threshold, hri_min_snr,
+        extra
     ));
 
     if (!error_file.empty()) {
@@ -171,6 +51,11 @@ int phypp_main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (clean_group && clean_model == "nearest_hri") {
+        warning("cannot use group cleaning with 'nearest_hri' cleaning");
+        clean_group = false;
+    }
+
     outdir = file::directorize(outdir);
     file::mkdir(outdir);
 
@@ -182,6 +67,12 @@ int phypp_main(int argc, char* argv[]) {
     vec<1,image_t> images;
     if (!read_image_list(argv[1], images)) {
         return 1;
+    }
+
+    if (!extra.empty()) {
+        if (!read_image_list(extra, images)) {
+            return 1;
+        }
     }
 
     // Remove bands we don't want
@@ -206,8 +97,7 @@ int phypp_main(int argc, char* argv[]) {
     double worst_seeing = 0;
     double ra0 = 0, dec0 = 0;
     uint_t ncovered = 0;
-    uint_t nhri = 0;
-    image_t* hri = nullptr;
+    std::vector<image_t*> hri;
     bool has_clean = false;
     bool has_detect = false;
     bool has_homogenize = false;
@@ -251,19 +141,57 @@ int phypp_main(int argc, char* argv[]) {
         if (!img.psffile.empty()) {
             // Read the PSF
             fits::read(img.psffile, img.psf);
+
+            // Make sure the PSF is centered
+            vec1i idm = mult_ids(img.psf, max_id(img.psf));
+            img.psf = recenter(img.psf, idm[0], idm[1]);
+
             if (!is_finite(img.seeing)) {
                 img.seeing = get_seeing(img.psf, img.psf.dims[0]/2, img.psf.dims[1]/2);
             }
-
-            // Adapt the PSF image to the dimensions of the analyzed image
-            // and make sure it is centered
-            vec1i idm = mult_ids(img.psf, max_id(img.psf));
-            img.psf = recenter(img.psf, idm[0], idm[1], img.data.dims);
         } else {
             // Create a PSF if it is not provided
-            img.psf = gaussian_profile(img.data.dims, img.seeing/2.355/img.aspix,
-                img.data.dims[0]/2, img.data.dims[1]/2
+            // NB: make sure it is large enough that any source in the image will be
+            // probably modeled without reaching the edge of the PSF image
+            img.psf = gaussian_profile({{img.data.dims[0]*2+1, img.data.dims[1]*2+1}},
+                img.seeing/2.355/img.aspix, img.data.dims[0], img.data.dims[1]
             );
+        }
+
+        {
+            // Create astrometry of the PSF image
+            fits::header thdr = img.hdr;
+            double tra, tdec;
+            astro::xy2ad(img.wcs, img.data.dims[1]/2+1, img.data.dims[0]/2+1, tra, tdec);
+
+            fits::setkey(thdr, "NAXIS1", img.psf.dims[1]);
+            fits::setkey(thdr, "NAXIS2", img.psf.dims[0]);
+            fits::setkey(thdr, "CRPIX1", img.psf.dims[1]/2 + 1);
+            fits::setkey(thdr, "CRPIX2", img.psf.dims[0]/2 + 1);
+            fits::setkey(thdr, "CRVAL1", tra);
+            fits::setkey(thdr, "CRVAL2", tdec);
+            img.psf_wcs = astro::wcs(thdr);
+        }
+
+        std::string bad_file = file::remove_extension(img.filename)+"-bad.reg";
+        if (!file::exists(bad_file)) {
+            bad_file = file::remove_extension(img.filename)+"_bad.reg";
+            if (!file::exists(bad_file)) {
+                bad_file = "";
+            }
+        }
+
+        if (!bad_file.empty()) {
+            // Mask bad pixels
+            vec2d bad;
+            if (read_ds9_region_circles_physical(bad_file, img.wcs, bad)) {
+                vec2d bad_mask(img.data.dims);
+                for (uint_t i : range(bad.dims[0])) {
+                    bad_mask += circular_mask(img.data.dims, bad(i,2), bad(i,1), bad(i,0));
+                }
+
+                img.data[where(bad_mask > 0.5)] = dnan;
+            }
         }
 
         double fzero = fraction_of(img.data == 0);
@@ -291,8 +219,7 @@ int phypp_main(int argc, char* argv[]) {
                 has_homogenize = true;
             }
             if (img.hri) {
-                hri = &img;
-                ++nhri;
+                hri.push_back(&img);
             }
         }
 
@@ -341,16 +268,16 @@ int phypp_main(int argc, char* argv[]) {
         return 1;
     }
     if (clean_model == "hri") {
-        if (nhri > 1) {
-            error("when clean_model=hri, only one image can be flagged as hri=1 (got ", nhri, ")");
+        if (hri.size() > 1) {
+            error("when clean_model=hri, only one image can be flagged as hri=1 (got ", hri.size(), ")");
             return 1;
-        } else if (nhri == 0) {
+        } else if (hri.empty()) {
             error("no image found with hri=1, need one when clean_model=hri");
             return 1;
         }
     }
     if (clean_model == "nearest_hri") {
-        if (nhri == 0) {
+        if (hri.empty()) {
             error("no image found with hri=1, need at least one when clean_model=nearest_hri");
             return 1;
         }
@@ -393,8 +320,10 @@ int phypp_main(int argc, char* argv[]) {
     vec2d det_img;
     vec2d det_psf;
     astro::wcs det_wcs;
+    astro::wcs det_psf_wcs;
     double det_aspix = 0;
     fits::header det_hdr;
+    fits::header det_psf_hdr;
     if (reuse && file::exists(det_outfile)) {
         fits::input_image iimg(det_outfile);
 
@@ -414,6 +343,8 @@ int phypp_main(int argc, char* argv[]) {
 
                 iimg.reach_hdu(2);
                 iimg.read(det_psf);
+                det_psf_hdr = iimg.read_header();
+                det_psf_wcs = astro::wcs(det_psf_hdr);
 
                 rebuild_detection = false;
             } else {
@@ -449,10 +380,22 @@ int phypp_main(int argc, char* argv[]) {
             }
 
             det_img.resize(p.dims_y, p.dims_x);
+
+            // The PSF will be twice larger
+            isize = 2*isize+1;
+            p.dims_x = p.dims_y = isize;
+            p.pixel_ref_x = p.pixel_ref_y = p.dims_x/2.0 + 1.0;
+
+            if (!make_wcs_header(p, det_psf_hdr)) {
+                write_error("could not make detection PSF header WCS");
+                return 1;
+            }
+
             det_psf.resize(p.dims_y, p.dims_x);
         }
 
         det_wcs = astro::wcs(det_hdr);
+        det_psf_wcs = astro::wcs(det_psf_hdr);
         fits::setkey(det_hdr, "SEEING", det_seeing, "[arcsec]");
         fits::setkey(det_hdr, "CACHEID", "'"+det_cache_hash+"'");
 
@@ -481,7 +424,7 @@ int phypp_main(int argc, char* argv[]) {
             }
 
             // Regrid
-            img.regrid_data(det_wcs, det_hdr, det_aspix, reuse, det_cache_hash, outdir);
+            img.regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
 
             // Make a copy, because we won't keep it
             vec2d tdata = rdata;
@@ -525,7 +468,7 @@ int phypp_main(int argc, char* argv[]) {
             }
 
             append<2>(cube, reform(tdata - med, tdata.dims, 1));
-            append<2>(cube_psf, reform(tpsf, tdata.dims, 1));
+            append<2>(cube_psf, reform(tpsf, tpsf.dims, 1));
         }
 
         // Build stacked image and add it to the cube
@@ -557,6 +500,7 @@ int phypp_main(int argc, char* argv[]) {
         oimg.write_header(det_hdr);
         oimg.reach_hdu(2);
         oimg.write(det_psf);
+        oimg.write_header(det_psf_hdr);
     }
 
     if (has_clean) {
@@ -568,30 +512,18 @@ int phypp_main(int argc, char* argv[]) {
             note("cleaning detection image...");
         }
 
-        // vec2d det_psf;
-
-        // if () {
-        //     // Only one image used for detection, use it's PSF directly
-        //     det_psf = dimg.regridded_psf;
-        // } else {
-        //     // Build an effective PSF from the chosen detection seeing
-        //     det_psf = gaussian_profile(det_img.dims,
-        //         det_seeing/2.355/det_aspix, det_img.dims[0]/2, det_img.dims[1]/2
-        //     );
-
-        //     det_psf /= max(det_psf);
-        // }
-
         vec2d model(det_img.dims);
         vec2d det_img_clean; {
             vec2d tdimg = det_img;
             uint_t mid = max_id(det_img);
             uint_t iter = 0;
+
+            vec2d clean_psf = det_psf;
+            clean_psf /= max(clean_psf);
+
             while (tdimg[mid] > clean_threshold) {
                 vec1i ids = mult_ids(tdimg, mid);
-                vec2d tpsf = translate_integer(det_psf,
-                    ids[0] - int_t(det_psf.dims[0])/2, ids[1] - int_t(det_psf.dims[1])/2
-                );
+                vec2d tpsf = make_point_source_integer(clean_psf, tdimg.dims, ids[0], ids[1]);
 
                 if (debug_clean && iter % 20 == 0) {
                     print("clean ", iter, ": max ", tdimg[mid], " pos: ", ids);
@@ -609,12 +541,21 @@ int phypp_main(int argc, char* argv[]) {
                 ++iter;
             }
 
+            model[where(model > 0)] += clean_threshold;
+
+            if (!is_finite(clean_conv_seeing)) {
+                clean_conv_seeing = 0.66*det_seeing;
+            }
+
             vec2d model_psf = gaussian_profile(det_img.dims,
                 clean_conv_seeing/2.355/det_aspix, det_img.dims[0]/2, det_img.dims[1]/2
             );
 
             model_psf /= max(model_psf);
+
             det_img_clean = convolve2d(model, model_psf);
+
+            model[where(model > 0)] -= clean_threshold;
 
             fits::output_image oimg(outdir+"detection_image_cleaned.fits");
             oimg.reach_hdu(1);
@@ -634,8 +575,8 @@ int phypp_main(int argc, char* argv[]) {
         }
 
         segment_deblend_params sdp;
-        sdp.detect_threshold = 0.5;
-        sdp.deblend_threshold = det_seeing/det_aspix;
+        sdp.detect_threshold = det_threshold;
+        sdp.deblend_threshold = 0.5*det_seeing/det_aspix;
         sdp.min_area = det_min_area;
         segment_deblend_output sdo;
         vec2u seg = segment_deblend(det_img_clean, sdo, sdp);
@@ -652,7 +593,8 @@ int phypp_main(int argc, char* argv[]) {
                 }
             }
 
-            if (bestd > sqr(det_seeing/2.355/det_aspix)) {
+            double search_radius = det_seeing/2.355/det_aspix;
+            if (bestd > sqr(search_radius)) {
                 write_warning("the target source was not found in the detection image");
                 write_warning("(the closest source was found at ", sqrt(bestd)*det_aspix, " arcsec)");
                 write_warning("it will be added as a central point source for the fitting stage");
@@ -663,12 +605,31 @@ int phypp_main(int argc, char* argv[]) {
                 sdo.py.push_back(det_img.dims[0]/2);
                 sdo.bx.push_back(sdo.px.back());
                 sdo.by.push_back(sdo.py.back());
-                sdo.area.push_back(1);
                 sdo.origin.push_back(flat_id(seg, sdo.py.back(), sdo.px.back()));
-                sdo.flux.push_back(det_img(sdo.py.back(), sdo.px.back()));
 
-                seg(sdo.py.back(), sdo.px.back()) = sdo.id.back();
-                model(sdo.py.back(), sdo.px.back()) = 1.0;
+                if (clean_model == "psf" || clean_model == "clean") {
+                    // A point source will suffice
+                    sdo.area.push_back(1);
+                    sdo.flux.push_back(det_img_clean(sdo.py.back(), sdo.px.back()));
+                    model(sdo.py.back(), sdo.px.back()) = 1.0;
+                    seg(sdo.py.back(), sdo.px.back()) = sdo.id.back();
+                } else {
+                    // Need to assign the source a large segmentation area, let's use the search radius
+                    vec1u idc = where(circular_mask(model.dims, search_radius, sdo.py.back(), sdo.px.back()) > 0.5);
+                    sdo.area.push_back(idc.size());
+                    sdo.flux.push_back(total(det_img_clean[idc]));
+                    model(sdo.py.back(), sdo.px.back()) = 1.0;
+                    for (uint_t i : idc) {
+                        if (seg[i] != 0) {
+                            uint_t is = where_first(sdo.id == seg[i]);
+                            if (is != npos) {
+                                sdo.area[is] -= 1.0;
+                                sdo.flux[is] -= det_img_clean[i];
+                            }
+                        }
+                    }
+                    seg[idc] = sdo.id.back();
+                }
             }
         }
 
@@ -698,7 +659,7 @@ int phypp_main(int argc, char* argv[]) {
                 if (rdata.empty()) {
                     // Regrid, if not done at the detection stage already
                     if (verbose) note("  regridding...");
-                    img.regrid_data(det_wcs, det_hdr, det_aspix, reuse, det_cache_hash, outdir);
+                    img.regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
                 }
 
                 if (!img.noconvolve && !img.convolved) {
@@ -707,7 +668,8 @@ int phypp_main(int argc, char* argv[]) {
                 }
 
                 fitmask = fitmask && is_finite(rdata);
-                img.make_finite();
+                img.mask = vec2d(is_finite(rdata));
+                rdata[where(img.mask < 0.5)] = 0;
                 ++nhomo;
             }
 
@@ -720,8 +682,8 @@ int phypp_main(int argc, char* argv[]) {
             if (clean_model == "psf") {
                 // Assume point sources
                 for (uint_t s : range(sdo.id)) {
-                    models(s+1,_) = flatten(translate(det_psf,
-                        sdo.py[s] - int_t(det_img.dims[0]/2), sdo.px[s] - int_t(det_img.dims[1]/2)
+                    models(s+1,_) = flatten(make_point_source(
+                        det_psf, det_img.dims, sdo.py[s], sdo.px[s]
                     ));
                 }
             } else if (clean_model == "clean") {
@@ -731,13 +693,43 @@ int phypp_main(int argc, char* argv[]) {
                     vec2d tmod(det_img.dims);
                     tmod[ids] = model[ids]/max(model[ids]);
                     // Convolve to the resolution of the fitted image
+                    // NB: we have to assume the same PSF for all homogenized images
                     tmod = convolve2d(tmod, det_psf);
                     // Save model
                     models(imod,_) = flatten(tmod);
                     ++imod;
                 });
-            } else if (clean_model == "nearest_hri" || clean_model == "hri") {
-                write_error("HRI fitting is not implemented");
+            } else if (clean_model == "hri") {
+                auto& hdata = hri[0]->regridded_data_noconvol;
+                if (hdata.empty()) {
+                    // Regrid, if not done at the detection stage already
+                    if (verbose) note("  regridding HRI...");
+                    hri[0]->regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
+                }
+
+                double rms = 1.48*mad(hdata);
+                uint_t imod = 1;
+                foreach_segment(seg, sdo.origin, [&](const vec1u& ids) {
+                    // Get pixels of that segment
+                    vec2d tmod(det_img.dims);
+                    tmod[ids] = hdata[ids];
+                    double tt = total(tmod[ids])/(rms*sqrt(ids.size()));
+                    if (tt > hri_min_snr) {
+                        // Keep the HRI model
+                        tmod /= max(hdata[ids]);
+                        // Convolve to the resolution of the fitted image
+                        tmod = convolve2d(tmod, det_psf);
+                        models(imod,_) = flatten(tmod);
+                    } else {
+                        // Not enough SNR, make that a point source
+                        models(imod,_) = flatten(make_point_source(
+                            det_psf, det_img.dims, sdo.py[imod-1], sdo.px[imod-1]
+                        ));
+                    }
+                    ++imod;
+                });
+            } else if (clean_model == "nearest_hri") {
+                write_error("trying to clean with 'nearest_hri' with group cleaning enabled");
                 return 1;
             }
 
@@ -774,6 +766,7 @@ int phypp_main(int argc, char* argv[]) {
                 uint_t ihomo = 0;
                 for (auto& img : images) {
                     if (!img.covered || !img.clean_neighbors || img.noconvolve) continue;
+                    if (img.nodance && (dy != 0 || dx != 0)) continue;
 
                     img.fit_neighbors(batch, models, idf, gmodel, dance_chi2_range,
                         dance_step_pix*dy, dance_step_pix*dx
@@ -823,6 +816,10 @@ int phypp_main(int argc, char* argv[]) {
                         img.regridded_data = translate_integer(img.regridded_data,
                             -dance_step_pix*fit_dy[ihomo], -dance_step_pix*fit_dx[ihomo]
                         );
+                        // Don't forget to shift the mask too!
+                        img.mask = translate_integer(img.mask,
+                            -dance_step_pix*fit_dy[ihomo], -dance_step_pix*fit_dx[ihomo]
+                        );
                     }
 
                     fits::setkey(img.regridded_hdr, "DANCEX", img.regridded_aspix*dance_step_pix*fit_dx[ihomo], "dance offset [arcsec]");
@@ -862,7 +859,7 @@ int phypp_main(int argc, char* argv[]) {
                     img.regridded_data -= fit_fluxes(ihomo,m)*tmod;
                 }
 
-                img.restore_not_finite();
+                img.regridded_data[where(img.mask < 0.5)] = dnan;
                 img.cleaned = true;
                 ++ihomo;
             }
@@ -879,7 +876,7 @@ int phypp_main(int argc, char* argv[]) {
             if (rdata.empty()) {
                 // Regrid, if not done at the detection stage already
                 if (verbose) note("  regridding...");
-                img.regrid_data(det_wcs, det_hdr, det_aspix, reuse, det_cache_hash, outdir);
+                img.regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
             }
 
             if (!img.noconvolve && !img.convolved) {
@@ -897,8 +894,8 @@ int phypp_main(int argc, char* argv[]) {
             if (clean_model == "psf") {
                 // Assume point sources
                 for (uint_t s : range(sdo.id)) {
-                    models(s+1,_) = flatten(translate(rpsf,
-                        sdo.py[s] - int_t(rdata.dims[0]/2), sdo.px[s] - int_t(rdata.dims[1]/2)
+                    models(s+1,_) = flatten(make_point_source(
+                        rpsf, rdata.dims, sdo.py[s], sdo.px[s]
                     ));
                 }
             } else if (clean_model == "clean") {
@@ -908,14 +905,90 @@ int phypp_main(int argc, char* argv[]) {
                     vec2d tmod(det_img.dims);
                     tmod[ids] = model[ids]/max(model[ids]);
                     // Convolve to the resolution of the fitted image
-                    tmod = convolve2d(tmod, img.regridded_psf);
+                    tmod = convolve2d(tmod, rpsf);
                     // Save model
                     models(imod,_) = flatten(tmod);
                     ++imod;
                 });
-            } else if (clean_model == "nearest_hri" || clean_model == "hri") {
-                write_error("HRI fitting is not implemented");
-                return 1;
+            } else if (clean_model == "hri") {
+                auto& hdata = hri[0]->regridded_data_noconvol;
+                if (hdata.empty()) {
+                    // Regrid, if not done at the detection stage already
+                    if (verbose) note("  regridding HRI...");
+                    hri[0]->regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
+                }
+
+                double rms = 1.48*mad(hdata);
+                uint_t imod = 1;
+                foreach_segment(seg, sdo.origin, [&](const vec1u& ids) {
+                    // Get pixels of that segment
+                    vec2d tmod(det_img.dims);
+                    tmod[ids] = hdata[ids];
+                    double tt = total(tmod[ids])/(rms*sqrt(ids.size()));
+                    if (tt > hri_min_snr) {
+                        // Keep the HRI model
+                        tmod /= max(tmod[ids]);
+                        // Convolve to the resolution of the fitted image
+                        tmod = convolve2d(tmod, rpsf);
+                        models(imod,_) = flatten(tmod);
+                    } else {
+                        // Not enough SNR, make that a point source
+                        models(imod,_) = flatten(make_point_source(
+                            rpsf, rdata.dims, sdo.py[imod-1], sdo.px[imod-1]
+                        ));
+                    }
+
+                    // Save model
+                    ++imod;
+                });
+            } else if (clean_model == "nearest_hri") {
+                vec1d dlam(hri.size());
+                vec1d hrms(hri.size());
+                for (uint_t h : range(hri)) {
+                    if (hri[h]->regridded_data_noconvol.empty()) {
+                        // Regrid, if not done at the detection stage already
+                        if (verbose) note("  regridding HRI...");
+                        hri[h]->regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
+                    }
+
+                    dlam[h] = log10(img.lambda/hri[h]->lambda);
+                    hrms[h] = 1.48*mad(hri[h]->regridded_data_noconvol);
+                }
+
+                vec1u shri = sort(dlam);
+
+                uint_t imod = 1;
+                foreach_segment(seg, sdo.origin, [&](const vec1u& ids) {
+                    // Get pixels of that segment
+                    vec2d tmod(det_img.dims);
+
+                    uint_t ihri = 0;
+                    do {
+                        tmod[ids] = hri[shri[ihri]]->regridded_data_noconvol[ids];
+                        double tt = total(tmod[ids])/(hrms[shri[ihri]]*sqrt(ids.size()));
+                        if (tt > hri_min_snr) {
+                            // Keep the HRI model
+                            tmod /= max(tmod[ids]);
+                            // Convolve to the resolution of the fitted image
+                            tmod = convolve2d(tmod, rpsf);
+                            models(imod,_) = flatten(tmod);
+                            break;
+                        } else {
+                            // Not enough SNR, try next HRI
+                            ++ihri;
+                        }
+                    } while (ihri < hri.size());
+
+                    if (ihri == hri.size()) {
+                        // Not enough SNR, make that a point source
+                        models(imod,_) = flatten(make_point_source(
+                            rpsf, rdata.dims, sdo.py[imod-1], sdo.px[imod-1]
+                        ));
+                    }
+
+                    // Save model
+                    ++imod;
+                });
             }
 
             // Inspect models and flag out the ones that are zero
@@ -936,7 +1009,8 @@ int phypp_main(int argc, char* argv[]) {
             if (verbose) note("  fitting...");
 
             // Do the fit
-            img.make_finite();
+            img.mask = vec2d(is_finite(rdata));
+            rdata[where(img.mask < 0.5)] = 0;
             vec1u idf = img.idf;
             vec1d err = replicate(1.0, idf.size());
             vec1d fit_fluxes(gmodel.size());
@@ -966,7 +1040,7 @@ int phypp_main(int argc, char* argv[]) {
             dofit(0, 0);
 
             // Adjust positions if asked
-            if (model_dance && dance_nstep > 0) {
+            if (model_dance && dance_nstep > 0 && !img.nodance) {
                 if (verbose) {
                     note("  dancing (", 2*dance_nstep+1, "x", 2*dance_nstep+1, ", step ",
                         dance_step_pix*det_aspix, "\")...");
@@ -985,6 +1059,10 @@ int phypp_main(int argc, char* argv[]) {
                 if (fit_dx != 0 || fit_dy != 0) {
                     // Shift the image for flux measurement later on
                     img.regridded_data = translate_integer(img.regridded_data,
+                        -dance_step_pix*fit_dy, -dance_step_pix*fit_dx
+                    );
+                    // Don't forget to shift the mask too!
+                    img.mask = translate_integer(img.mask,
                         -dance_step_pix*fit_dy, -dance_step_pix*fit_dx
                     );
                 }
@@ -1054,7 +1132,7 @@ int phypp_main(int argc, char* argv[]) {
                 otbl.write_columns("id", id, "x", sx, "y", sy, "flux", flux);
             }
 
-            img.restore_not_finite();
+            img.regridded_data[where(img.mask < 0.5)] = dnan;
             img.cleaned = true;
         }
     }
@@ -1070,7 +1148,7 @@ int phypp_main(int argc, char* argv[]) {
         if (rdata.empty()) {
             // Regrid, if not done in the previous stages already
             if (verbose) note("  regridding...");
-            img.regrid_data(det_wcs, det_hdr, det_aspix, reuse, det_cache_hash, outdir);
+            img.regrid_data(det_wcs, det_psf_wcs, det_hdr, det_psf_hdr, det_aspix, reuse, det_cache_hash, outdir);
         }
 
         if (!img.noconvolve && !img.convolved) {
@@ -1082,7 +1160,7 @@ int phypp_main(int argc, char* argv[]) {
 
         // Create background regions
         double bg_radius = img.aperture/det_aspix/2.0;
-        double threshold = 2.0;
+        double threshold = bg_threshold;
         vec1u bx, by;
 
         // Make sure the distance between each region is at least the aperture
@@ -1166,7 +1244,7 @@ int phypp_main(int argc, char* argv[]) {
 
         // Find good pixels
         img.mask = vec2d(is_finite(rdata));
-        rdata[where(img.mask == 0.0)] = 0;
+        rdata[where(img.mask < 0.5)] = 0;
 
         img.flux_bg = replicate(dnan, bx.size());
         vec1d bg_area(bx.size());
@@ -1181,15 +1259,13 @@ int phypp_main(int argc, char* argv[]) {
         }
 
         // Clip strong background outliers
-        vec1u idgbg = where(sigma_clip(img.flux_bg, 5.0));
+        vec1u idgbg = where(sigma_clip(img.flux_bg, 10.0));
         if (idgbg.size() < 3) {
-            // Not enough points left, be less stringent
-            idgbg = where(sigma_clip(img.flux_bg, 3.0));
-            if (idgbg.size() < 3) {
-                // Still not enough, just use everything
-                idgbg = uindgen(img.flux_bg.size());
-            }
+            // Still not enough, just use everything
+            idgbg = uindgen(img.flux_bg.size());
         }
+
+        img.num_bg = idgbg.size();
 
         // Compute and subtract background level
         img.background = median(img.flux_bg[idgbg]/bg_area[idgbg]);
@@ -1203,7 +1279,8 @@ int phypp_main(int argc, char* argv[]) {
         img.flux_err = stddev(img.flux_bg[idgbg])*sqrt(1.0 + 1.0/idgbg.size());
 
         // Compute aperture correction from this image's PSF (assumes point source!)
-        vec2d model = translate(rpsf, y0 - rpsf.dims[0]/2, x0 - rpsf.dims[1]/2);
+        vec2d model = make_point_source(rpsf, rdata.dims, y0, x0);
+        // vec2d model = translate(rpsf, y0 - rpsf.dims[0]/2, x0 - rpsf.dims[1]/2);
         img.apcor = 1.0/total(model*aper_mask*img.mask);
 
         // Apply aperture correction
@@ -1211,7 +1288,7 @@ int phypp_main(int argc, char* argv[]) {
         img.flux_err *= img.apcor;
 
         // Write regridded, convolved and background subtracted image
-        rdata[where(img.mask == 0.0)] = dnan;
+        rdata[where(img.mask < 0.5)] = dnan;
         fits::write(outdir+img.base_filename+"_regrid.fits",
             rdata, img.regridded_hdr
         );
@@ -1228,6 +1305,7 @@ int phypp_main(int argc, char* argv[]) {
     vec1s imgfile;
     vec1f flux, flux_err, apcor, background;
     vec1s bands; vec1u eazy_bands; vec1f lambda;
+    vec1u num_bg;
 
     for (auto& img : images) {
         imgfile.push_back(img.filename);
@@ -1238,10 +1316,11 @@ int phypp_main(int argc, char* argv[]) {
         bands.push_back(img.band);
         lambda.push_back(img.lambda);
         eazy_bands.push_back(img.eazy_band);
+        num_bg.push_back(img.num_bg);
     }
 
     fits::write_table(outdir+"fluxes.fits", ftable(
-        imgfile, apcor, background, flux, flux_err, bands, lambda, eazy_bands
+        imgfile, apcor, background, flux, flux_err, bands, lambda, eazy_bands, num_bg
     ));
 
     return 0;
