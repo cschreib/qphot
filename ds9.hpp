@@ -1,8 +1,8 @@
-bool read_ds9_region_circles(std::string file_name, vec2d& regs, bool& physical,
+void read_ds9_region_circles(std::string file_name, vec2d& regs, bool& physical,
     std::string color) {
+
     if (!file::exists(file_name)) {
-        write_error("could not open region file '", file_name, "'");
-        return false;
+        throw std::runtime_error("could not open region file '"+file_name+"'");
     }
 
     std::ifstream file(file_name);
@@ -39,42 +39,36 @@ bool read_ds9_region_circles(std::string file_name, vec2d& regs, bool& physical,
         std::string targs = line.substr(spos+1, epos-(spos+1));
         vec1s args = split(targs, ",");
         if (args.size() != 3) {
-            write_error(file_name, ":", l, ": ",
-                "ill formed 'circle' line, expecting 3 arguments, got ", args.size());
-            return false;
+            throw std::runtime_error(file_name+":"+strn(l)+": "
+                "ill formed 'circle' line, expecting 3 arguments, got "+strn(args.size()));
         }
 
         double ra, dec, rad;
         args = trim(args);
         if (args[0].find_first_of(':') != args[0].npos) {
             if (!sex2deg(args[0], args[1], ra, dec)) {
-                write_error(file_name, ":", l, ": ",
+                throw std::runtime_error(file_name+":"+strn(l)+": "
                     "could not convert sexagesimal coordinates to degrees");
-                return false;
             }
 
             if (!end_with(args[2], "\"")) {
-                write_error(file_name, ":", l, ": expected radius in arcsec");
-                return false;
+                throw std::runtime_error(file_name+":"+strn(l)+": expected radius in arcsec");
             }
         } else {
             if (!from_string(args[0], ra) || !from_string(args[1], dec)) {
-                write_error(file_name, ":", l, ": ",
-                    "could not read coordinates to ", (physical ? "(x,y)" : "degrees"));
-                return false;
+                throw std::runtime_error(file_name+":"+strn(l)+": "
+                    "could not read coordinates to "+std::string(physical ? "(x,y)" : "degrees"));
             }
         }
 
         if (physical) {
             if (!from_string(args[2], rad)) {
-                write_error(file_name, ":", l, ": could not read radius in pixels");
-                return false;
+                throw std::runtime_error(file_name+":"+strn(l)+": could not read radius in pixels");
             }
         } else {
             args[2] = erase_end(args[2], "\"");
             if (!from_string(args[2], rad)) {
-                write_error(file_name, ":", l, ": could not read radius in arcsec");
-                return false;
+                throw std::runtime_error(file_name+":"+strn(l)+": could not read radius in arcsec");
             }
         }
 
@@ -95,20 +89,19 @@ bool read_ds9_region_circles(std::string file_name, vec2d& regs, bool& physical,
 
         append<0>(regs, vec2d{{ra, dec, rad}});
     }
-
-    return true;
 }
 
-bool read_ds9_region_circles_physical(std::string file_name,
+void read_ds9_region_circles_physical(std::string file_name,
     const astro::wcs& w, vec2d& regs, std::string color = "") {
 
     bool physical = false;
-    if (!read_ds9_region_circles(file_name, regs, physical, color)) return false;
+    read_ds9_region_circles(file_name, regs, physical, color);
 
-    if (physical) return true;
+    if (physical) return;
 
-    if (!w.is_valid()) {
-        return false;
+    double aspix = 1.0;
+    if (!w.is_valid() || !astro::get_pixel_size(w, aspix)) {
+        throw std::runtime_error("invalid WCS, cannot convert regions");
     }
 
     for (uint_t i : range(regs.dims[0])) {
@@ -118,14 +111,7 @@ bool read_ds9_region_circles_physical(std::string file_name,
         regs(i,1) = y-1;
     }
 
-    double aspix = 1.0;
-    if (!astro::get_pixel_size(w, aspix)) {
-        return false;
-    }
-
     regs(_,2) /= aspix;
-
-    return true;
 }
 
 void write_ds9_region(const std::string& filename, const astro::wcs& w,

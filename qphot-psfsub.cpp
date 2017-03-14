@@ -1,5 +1,4 @@
 #include <phypp.hpp>
-#include "log.hpp"
 #include "image.hpp"
 #include "ds9.hpp"
 
@@ -20,14 +19,17 @@ int phypp_main(int argc, char* argv[]) {
         template_file
     ));
 
+    outdir = file::directorize(outdir);
+    file::mkdir(outdir);
+
     if (!is_finite(ra) || !is_finite(dec)) {
         error("please provide ra=... and dec=... of the star to subtract");
         return 1;
     }
 
     // Get files and their properties
-    vec<1,image_t> images;
-    if (!read_image_list(argv[1], images)) {
+    vec<1,image_source_t> images;
+    if (!read_image_source_list(argv[1], images)) {
         return 1;
     }
 
@@ -54,39 +56,38 @@ int phypp_main(int argc, char* argv[]) {
     }
 
     for (auto& img : images) {
-        img.input_image = std::unique_ptr<fits::input_image>(
-            new fits::input_image(img.filename)
-        );
-
-        auto& iimg = *img.input_image;
+        fits::input_image iimg(img.filename);
 
         if (!iimg.is_image()) {
-            write_error("'", img.filename, "' is not a FITS image");
+            error("'", img.filename, "' is not a FITS image");
             return 1;
         }
 
-        img.hdr = iimg.read_header();
-        img.wcs = astro::wcs(img.hdr);
-        if (!astro::get_pixel_size(img.wcs, img.aspix)) {
-            write_error("could not find pixel size in '", img.filename, "'");
+        fits::header hdr = iimg.read_header();
+        astro::wcs w = astro::wcs(hdr);
+        double aspix;
+        if (!astro::get_pixel_size(w, aspix)) {
+            error("could not find pixel size in '", img.filename, "'");
             return 1;
         }
 
-        iimg.read(img.data);
+        vec2d data;
+        iimg.read(data);
 
+        vec2d psf;
         if (!img.psffile.empty()) {
             // Read the PSF
-            fits::read(img.psffile, img.psf);
+            fits::read(img.psffile, psf);
 
             // Adapt the PSF image to the dimensions of the analyzed image
             // and make sure it is centered
-            vec1i idm = mult_ids(img.psf, max_id(img.psf));
-            img.psf = recenter(img.psf, idm[0], idm[1], img.psf.dims);
-            img.psf[where(!is_finite(img.psf))] = 0;
+            vec1i idm = mult_ids(psf, max_id(psf));
+            psf = recenter(psf, idm[0], idm[1], psf.dims);
+            psf[where(!is_finite(psf))] = 0;
         } else {
             // Create a PSF if it is not provided
-            img.psf = gaussian_profile(img.data.dims, img.seeing/2.355/img.aspix,
-                img.data.dims[0]/2, img.data.dims[1]/2
+            psf = gaussian_profile(data.dims, img.seeing/2.355/aspix,
+                data.dims[0]/2, data.dims[1]/2
             );
         }
 
@@ -101,47 +102,45 @@ int phypp_main(int argc, char* argv[]) {
         if (!bad_file.empty()) {
             // Mask bad pixels
             vec2d bad;
-            if (read_ds9_region_circles_physical(bad_file, img.wcs, bad)) {
-                vec2d bad_mask(img.data.dims);
-                for (uint_t i : range(bad.dims[0])) {
-                    bad_mask += circular_mask(img.data.dims, bad(i,2), bad(i,1), bad(i,0));
-                }
-
-                img.data[where(bad_mask > 0.5)] = dnan;
+            read_ds9_region_circles_physical(bad_file, w, bad);
+            vec2d bad_mask(data.dims);
+            for (uint_t i : range(bad.dims[0])) {
+                bad_mask += circular_mask(data.dims, bad(i,2), bad(i,1), bad(i,0));
             }
+
+            data[where(bad_mask > 0.5)] = dnan;
         }
 
-        double fzero = fraction_of(img.data == 0);
-        double fnfin = fraction_of(!is_finite(img.data));
+        double fzero = fraction_of(data == 0);
+        double fnfin = fraction_of(!is_finite(data));
         if (fzero > 0.4) {
-            write_warning("ignoring image '", img.filename, "' because it contains ",
+            warning("ignoring image '", img.filename, "' because it contains ",
                 round(fzero*100), "% of zero values");
-            img.data[_] = dnan;
-            img.covered = false;
+            continue;
         } else if (fnfin > 0.4) {
-            write_warning("ignoring image '", img.filename, "' because it contains ",
+            warning("ignoring image '", img.filename, "' because it contains ",
                 round(fnfin*100), "% of invalid values");
-            img.data[_] = dnan;
-            img.covered = false;
+            continue;
         }
 
-        vec2b mask = !is_finite(img.data);
+        vec2b mask = !is_finite(data);
         vec2d maskreg;
-        if (file::exists(fit_mask) && read_ds9_region_circles_physical(fit_mask, img.wcs, maskreg)) {
-            vec2d bad_mask(img.data.dims);
+        if (file::exists(fit_mask)) {
+            read_ds9_region_circles_physical(fit_mask, w, maskreg);
+            vec2d bad_mask(data.dims);
             for (uint_t i : range(maskreg.dims[0])) {
-                bad_mask += circular_mask(img.data.dims, maskreg(i,2), maskreg(i,1), maskreg(i,0));
+                bad_mask += circular_mask(data.dims, maskreg(i,2), maskreg(i,1), maskreg(i,0));
             }
 
             mask = mask || bad_mask > 0.5;
         }
 
         double sx, sy;
-        astro::ad2xy(img.wcs, ra, dec, sx, sy);
+        astro::ad2xy(w, ra, dec, sx, sy);
         sx -= 1.0; sy -= 1.0;
 
         if (method == "radial") {
-            vec2d d = generate_img(img.data.dims, [&](double y, double x) {
+            vec2d d = generate_img(data.dims, [&](double y, double x) {
                 double ody = y - sy;
                 double odx = x - sx;
                 double dx = cos(angle*dpi/180)*odx + sin(angle*dpi/180)*ody;
@@ -153,7 +152,7 @@ int phypp_main(int argc, char* argv[]) {
             vec2d db = make_bins(0.0, max(d), uint_t(ceil(max(d)/3.00)));
             vec1d dx = bin_center(db);
 
-            vec2d tdata = img.data;
+            vec2d tdata = data;
             tdata[where(mask)] = dnan;
             vec1d df(dx.dims);
 
@@ -167,9 +166,9 @@ int phypp_main(int argc, char* argv[]) {
 
             vec1u idg = where(is_finite(df));
             if (!idg.empty()) {
-                img.data -= reform(interpolate(df[idg], dx[idg], flatten(d)), img.data.dims);
+                data -= reform(interpolate(df[idg], dx[idg], flatten(d)), data.dims);
                 fits::write_table(file::remove_extension(img.filename)+"_profile.fits",
-                    "d", dx[idg]*img.aspix, "f", df[idg]
+                    "d", dx[idg]*aspix, "f", df[idg]
                 );
             } else {
                 warning("could not clean ", img.filename);
@@ -180,8 +179,8 @@ int phypp_main(int argc, char* argv[]) {
             bres.chi2 = dinf;
             int_t dx_max = 5, dy_max = 5;
             double dp = 0.2;
-            int_t np = img.psf.dims[0]/2;
-            int_t ni = img.data.dims[0]/2;
+            int_t np = psf.dims[0]/2;
+            int_t ni = data.dims[0]/2;
             vec1u idf = where(!mask);
 
             sx -= ni;
@@ -189,10 +188,10 @@ int phypp_main(int argc, char* argv[]) {
 
             for (int_t dy = -dy_max; dy <= dy_max; ++dy)
             for (int_t dx = -dx_max; dx <= dx_max; ++dx) {
-                vec2d npsf = translate(img.psf, sy+dy*dp, sx+dx*dp);
+                vec2d npsf = translate(psf, sy+dy*dp, sx+dx*dp);
                 npsf = npsf((np-ni)-_-(np+ni),(np-ni)-_-(np+ni));
 
-                auto res = linfit(img.data[idf], 1.0, 1.0, npsf[idf]);
+                auto res = linfit(data[idf], 1.0, 1.0, npsf[idf]);
                 if (res.success && res.chi2 < bres.chi2) {
                     bres = res;
                     bpsf = npsf;
@@ -200,21 +199,21 @@ int phypp_main(int argc, char* argv[]) {
             }
 
             if (bres.success) {
-                img.data -= bpsf*bres.params[1];
+                data -= bpsf*bres.params[1];
             } else {
                 warning("could not clean ", img.filename);
             }
         } else if (method == "template") {
-            vec2d d = generate_img(img.data.dims, [&](double y, double x) {
+            vec2d d = generate_img(data.dims, [&](double y, double x) {
                 double ody = y - sy;
                 double odx = x - sx;
                 double dx = cos(angle*dpi/180)*odx + sin(angle*dpi/180)*ody;
                 double dy = cos(angle*dpi/180)*ody - sin(angle*dpi/180)*odx;
                 dx *= axis_ratio;
-                return img.aspix*sqrt(sqr(dy) + sqr(dx));
+                return aspix*sqrt(sqr(dy) + sqr(dx));
             });
 
-            vec2d model = reform(interpolate(tpl_f, tpl_r, flatten(d)), img.data.dims);
+            vec2d model = reform(interpolate(tpl_f, tpl_r, flatten(d)), data.dims);
 
             linfit_result bres;
             vec2d bpsf;
@@ -225,8 +224,8 @@ int phypp_main(int argc, char* argv[]) {
 
             for (int_t dy = -dy_max; dy <= dy_max; ++dy)
             for (int_t dx = -dx_max; dx <= dx_max; ++dx) {
-                vec2d npsf = convolve2d(translate(model, dy*dp, dx*dp), img.psf);
-                auto res = linfit(img.data[idf], 1.0, 1.0, npsf[idf]);
+                vec2d npsf = convolve2d(translate(model, dy*dp, dx*dp), psf);
+                auto res = linfit(data[idf], 1.0, 1.0, npsf[idf]);
                 if (res.success && res.chi2 < bres.chi2) {
                     bres = res;
                     bpsf = npsf;
@@ -234,15 +233,15 @@ int phypp_main(int argc, char* argv[]) {
             }
 
             if (bres.success) {
-                img.data -= bpsf*bres.params[1];
+                data -= bpsf*bres.params[1];
             } else {
                 warning("could not clean ", img.filename);
             }
         }
 
         fits::output_image oimg(outdir+file::get_basename(img.filename));
-        oimg.write(img.data);
-        oimg.write_header(img.hdr);
+        oimg.write(data);
+        oimg.write_header(hdr);
     }
 
     return 0;
