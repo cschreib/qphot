@@ -2,6 +2,8 @@
 #include "state.hpp"
 
 int phypp_main(int argc, char* argv[]) {
+    astro::wcs::enable_errors();
+
     options_t opts;
 
     read_args(argc-1, argv+1, arg_list(
@@ -11,7 +13,7 @@ int phypp_main(int argc, char* argv[]) {
         opts.dance_step, opts.dance_max, opts.dance_chi2_range, opts.det_min_area,
         opts.debug_clean, opts.no_neighbor_mask_background, opts.save_models, opts.det_threshold,
         opts.bg_threshold, opts.hri_min_snr, opts.extra, opts.nocuts, opts.priors, opts.cutout_size,
-        opts.show_progress, opts.save_interval, opts.threads
+        opts.show_progress, opts.save_interval, opts.threads, opts.merge
     ));
 
     if (opts.clean_model != "psf" && opts.clean_model != "hri" &&
@@ -34,6 +36,14 @@ int phypp_main(int argc, char* argv[]) {
     if (opts.show_progress && opts.verbose) {
         warning("disabling 'show_progress' option because 'verbose' is set");
         opts.show_progress = false;
+    }
+
+    if (opts.threads > 1 && fits_is_reentrant() == 0) {
+        warning("the CFITSIO library does not support multithreading, will run in single thread");
+        opts.threads = 1;
+    }
+    if (opts.threads == 0) {
+        opts.threads = 1;
     }
 
     opts.outdir = file::directorize(opts.outdir);
@@ -78,10 +88,12 @@ int phypp_main(int argc, char* argv[]) {
 
     if (!opts.priors.empty()) {
         // Read a set of positions from a catalog and extract cutouts on the fly
+        vec1s osid;
+        vec1d ora, odec;
+        fits::read_table(opts.priors, "sid", osid, "ra", ora, "dec", odec);
+
         vec1s sid;
         vec1d ra, dec;
-        fits::read_table(opts.priors, ftable(sid, ra, dec));
-
         vec2f flux, flux_err, apcor, background;
         vec2u num_bg;
 
@@ -90,11 +102,37 @@ int phypp_main(int argc, char* argv[]) {
         vec1u eazy_bands;
         vec1f lambda;
 
-        for (auto& img : image_sources) {
-            imgfile.push_back(img.filename);
-            bands.push_back(img.band);
-            lambda.push_back(img.lambda);
-            eazy_bands.push_back(img.eazy_band);
+        if (opts.merge) {
+            fits::read_table(opts.outdir+"fluxes.fits", ftable(
+                sid, ra, dec, flux, flux_err, apcor, background, num_bg,
+                imgfile, bands, lambda, eazy_bands
+            ));
+
+            if (opts.verbose) {
+                note("found ", sid.size(), " sources in the existing catalog");
+            }
+
+            vec1u id1, id2;
+            match(osid, sid, id1, id2);
+
+            inplace_remove(osid, id1);
+            inplace_remove(ora, id1);
+            inplace_remove(odec, id1);
+
+            if (opts.verbose) {
+                note("will analyze ", osid.size(), " new sources");
+            }
+        } else {
+            if (opts.verbose) {
+                note("will analyze ", osid.size(), " sources");
+            }
+
+            for (auto& img : image_sources) {
+                imgfile.push_back(img.filename);
+                bands.push_back(img.band);
+                lambda.push_back(img.lambda);
+                eazy_bands.push_back(img.eazy_band);
+            }
         }
 
         auto save_catalog = [&]() {
@@ -112,12 +150,20 @@ int phypp_main(int argc, char* argv[]) {
             file::remove(opts.error_file);
         }
 
-        bool saved = false;
-        auto pg = progress_start(sid.size());
-        for (uint_t i : range(sid)) {
+        struct output_t {
+            uint_t id;
+            vec1d flux, flux_err, background, apcor;
+            vec1u num_bg;
+        };
+
+        // Thread safe processing function
+        auto process_source = [&](uint_t i) {
+            output_t o;
+            o.id = i;
+
             state_t st(image_sources, opts);
 
-            st.outdir = opts.outdir+sid[i]+"/";
+            st.outdir = opts.outdir+osid[i]+"/";
             if (!opts.nocuts) {
                 file::mkdir(st.outdir);
             }
@@ -126,40 +172,105 @@ int phypp_main(int argc, char* argv[]) {
                 st.errfile.open(opts.error_file, std::ios::app);
             }
 
-            st.extract_cutouts(ra[i], dec[i]);
+            st.extract_cutouts(ora[i], odec[i]);
             st.read_psfs();
             st.build_detection_image();
             st.clean_images();
             st.extract_fluxes();
 
-            vec1f tflx, terr, tbg, tac;
-            vec1u tnbg;
             for (auto& img : st.images) {
-                tflx.push_back(img.flux);
-                terr.push_back(img.flux_err);
-                tbg.push_back(img.background);
-                tac.push_back(img.apcor);
-                tnbg.push_back(img.num_bg);
+                o.flux.push_back(img.flux);
+                o.flux_err.push_back(img.flux_err);
+                o.background.push_back(img.background);
+                o.apcor.push_back(img.apcor);
+                o.num_bg.push_back(img.num_bg);
             }
 
-            append<0>(flux,       reform(std::move(tflx), 1, tflx.dims));
-            append<0>(flux_err,   reform(std::move(terr), 1, terr.dims));
-            append<0>(apcor,      reform(std::move(tac),  1, tac.dims));
-            append<0>(background, reform(std::move(tbg),  1, tbg.dims));
-            append<0>(num_bg,     reform(std::move(tnbg), 1, tnbg.dims));
+            return o;
+        };
+
+        // Non-thread safe function to compile results
+        bool saved = true;
+        auto save_source = [&](output_t o) {
+            uint_t nimg = o.flux.size();
+
+            sid.push_back(osid[o.id]);
+            ra.push_back(ora[o.id]);
+            dec.push_back(odec[o.id]);
+            append<0>(flux,       reform(std::move(o.flux),       1,     nimg));
+            append<0>(flux_err,   reform(std::move(o.flux_err),   1,     nimg));
+            append<0>(apcor,      reform(std::move(o.apcor),      1,     nimg));
+            append<0>(background, reform(std::move(o.background), 1,     nimg));
+            append<0>(num_bg,     reform(std::move(o.num_bg),     1,     nimg));
             saved = false;
 
-            if (opts.save_interval != 0 && i % opts.save_interval == 0 && i != 0) {
+            if (opts.save_interval != 0 &&
+                sid.size() % opts.save_interval == 0 && sid.size() != 0) {
                 save_catalog();
                 saved = true;
-                return 0;
+            }
+        };
+
+        if (opts.threads == 1) {
+            auto pg = progress_start(osid.size());
+            for (uint_t i : range(osid)) {
+                save_source(process_source(i));
+                if (opts.show_progress) progress(pg);
             }
 
-            if (opts.show_progress) progress(pg);
-        }
+            if (!saved) {
+                save_catalog();
+            }
+        } else {
+            if (opts.threads > 1 && opts.verbose) {
+                warning("will run in multiple threads, 'verbose' option disabled");
+                opts.verbose = false;
+            }
 
-        if (!saved) {
-            save_catalog();
+            auto tpool = thread::pool(opts.threads);
+
+            thread::lock_free_queue<output_t> save_queue;
+            std::atomic<uint_t> iter(0);
+
+            uint_t ifirst = 0;
+            uint_t source_per_thread = osid.size()/opts.threads + 1;
+            for (uint_t i : range(opts.threads)) {
+                uint_t ilast = min(ifirst + source_per_thread, osid.size());
+                vec1u do_ids = uindgen(ilast - ifirst) + ifirst;
+                ifirst = ilast;
+
+                tpool[i].start([&,do_ids]() {
+                    for (uint_t k : do_ids) {
+                        save_queue.push(process_source(k));
+                        ++iter;
+                    }
+                });
+            }
+
+            auto pg = progress_start(osid.size());
+            if (opts.show_progress) print_progress(pg, iter);
+
+            output_t o;
+            while (iter != osid.size()) {
+                while (save_queue.pop(o)) {
+                    save_source(o);
+                    if (opts.show_progress) print_progress(pg, iter);
+                }
+
+                thread::sleep_for(0.01);
+            }
+
+            for (auto& t : tpool) {
+                t.join();
+            }
+
+            while (save_queue.pop(o)) {
+                save_source(o);
+            }
+
+            if (!saved) {
+                save_catalog();
+            }
         }
     } else {
         for (auto& img : image_sources) {

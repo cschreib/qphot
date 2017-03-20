@@ -1,12 +1,3 @@
-struct input_image_t {
-    // FITS data
-    std::unique_ptr<fits::input_image> fits;
-    // Cached data
-    vec1u dims;
-    fits::header hdr;
-    astro::wcs wcs;
-};
-
 struct image_source_t {
     // Read from parameter file
     std::string filename;
@@ -26,7 +17,7 @@ struct image_source_t {
     // Static variables
     double lambda = dnan;
     uint_t eazy_band = npos;
-    vec<1,input_image_t> input_images;
+    vec1s input_images;
     double aspix = dnan;
 };
 
@@ -152,36 +143,29 @@ bool check_image_source_list(vec<1,image_source_t>& imgs) {
 
     // Get basic properties and checks about images
     for (auto& img : imgs) {
-        vec1s sects;
         if (end_with(img.filename, ".sectfits")) {
-            sects = fits::read_sectfits(img.filename);
+            img.input_images = fits::read_sectfits(img.filename);
         } else {
-            sects.push_back(img.filename);
+            img.input_images.push_back(img.filename);
         }
 
-        img.input_images.resize(sects.size());
-        for (uint_t i : range(sects)) {
-            auto& iimg = img.input_images[i];
-            iimg.fits = std::unique_ptr<fits::input_image>(
-                new fits::input_image(sects[i])
-            );
+        for (uint_t i : range(img.input_images)) {
+            fits::input_image iimg(img.input_images[i]);
 
-            if (!iimg.fits->is_image()) {
-                error("'", sects[i], "' is not a FITS image");
-                if (sects.size() > 1) {
+            if (!iimg.is_image()) {
+                error("'", img.input_images[i], "' is not a FITS image");
+                if (img.input_images.size() > 1) {
                     error("reading '", img.filename, "'");
                 }
                 return false;
             }
 
-            iimg.dims = iimg.fits->image_dims();
-            iimg.hdr = iimg.fits->read_header();
-            iimg.wcs = astro::wcs(iimg.hdr);
+            astro::wcs w = astro::wcs(iimg.read_header());
 
             double aspix = dnan;
-            if (!astro::get_pixel_size(iimg.wcs, aspix)) {
-                error("could not find pixel size in '", sects[i], "'");
-                if (sects.size() > 1) {
+            if (!astro::get_pixel_size(w, aspix)) {
+                error("could not find pixel size in '", img.input_images[i], "'");
+                if (img.input_images.size() > 1) {
                     error("reading '", img.filename, "'");
                 }
                 return false;

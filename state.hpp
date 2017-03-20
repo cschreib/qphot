@@ -33,6 +33,8 @@ struct options_t {
     std::string priors;
     double cutout_size = 20.0;
     uint_t save_interval = 0;
+    uint_t threads = 1;
+    bool merge = false;
 };
 
 struct image_t {
