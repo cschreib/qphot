@@ -7,6 +7,7 @@ struct options_t {
     bool verbose = false;
     bool show_progress = false;
     double aperture = dnan; // [arcsec]
+    double search_radius = dnan; // [arcsec]
     std::string exclude;
     std::string include;
     double det_seeing = 0;
@@ -87,6 +88,7 @@ struct state_t {
     std::string outdir;
     double det_seeing = dnan;
     double aperture = dnan;
+    double search_radius = dnan;
 
     // Detection stage output
     double smallest_aspix = dinf;
@@ -113,6 +115,7 @@ struct state_t {
 
         det_seeing = o.det_seeing;
         aperture = o.aperture;
+        search_radius = o.search_radius;
         outdir = o.outdir;
     }
 

@@ -118,8 +118,7 @@ void state_t::clean_images() {
                 }
             }
 
-            double search_radius = det_seeing/2.355/det_aspix;
-            if (bestd > sqr(search_radius)) {
+            if (bestd > sqr(search_radius/det_aspix)) {
                 write_warning("the target source was not found in the detection image");
                 write_warning("(the closest source was found at ", sqrt(bestd)*det_aspix, " arcsec)");
                 write_warning("it will be added as a central point source for the fitting stage");
@@ -139,8 +138,9 @@ void state_t::clean_images() {
                     model(sdo.py.back(), sdo.px.back()) = 1.0;
                     seg(sdo.py.back(), sdo.px.back()) = sdo.id.back();
                 } else {
-                    // Need to assign the source a large segmentation area, let's use the search radius
-                    vec1u idc = where(circular_mask(model.dims, search_radius, sdo.py.back(), sdo.px.back()) > 0.5);
+                    // Need to assign the source a large segmentation area, let's use half the search radius
+                    vec1u idc = where(circular_mask(model.dims,
+                        0.5*search_radius/det_aspix, sdo.py.back(), sdo.px.back()) > 0.5);
                     sdo.area.push_back(idc.size());
                     sdo.flux.push_back(total(det_img_clean[idc]));
                     model[idc] = 0;

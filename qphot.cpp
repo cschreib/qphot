@@ -13,7 +13,7 @@ int phypp_main(int argc, char* argv[]) {
         opts.dance_step, opts.dance_max, opts.dance_chi2_range, opts.det_min_area,
         opts.debug_clean, opts.no_neighbor_mask_background, opts.save_models, opts.det_threshold,
         opts.bg_threshold, opts.hri_min_snr, opts.extra, opts.nocuts, opts.priors, opts.cutout_size,
-        opts.show_progress, opts.save_interval, opts.threads, opts.merge
+        opts.show_progress, opts.save_interval, opts.threads, opts.merge, opts.search_radius
     ));
 
     if (opts.clean_model != "psf" && opts.clean_model != "hri" &&

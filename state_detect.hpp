@@ -160,6 +160,11 @@ void state_t::build_detection_image() {
         }
     }
 
+    // Set search radius if not defined
+    if (!is_finite(search_radius)) {
+        search_radius = det_seeing;
+    }
+
     if (opts.verbose) {
         note("worst seeing for detection is ", det_seeing, "\"");
         note("worst seeing for homogenization is ", worst_seeing, "\"");
