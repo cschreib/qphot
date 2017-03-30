@@ -6,87 +6,13 @@ void state_t::extract_cutouts(double ra, double dec) {
     }
 
     for (auto& img : images) {
-        int_t hs = max(10, ceil(0.5*opts.cutout_size/img.source.aspix));
-        double px = hs+1.0, py = hs+1.0;
-
-        fits::header first_hdr;
-        for (uint_t i : range(img.source.input_images)) {
-            // Look on each FITS image of the set if the source is covered
-            fits::input_image iimg(img.source.input_images[i]);
-            fits::header hdr = iimg.read_header();
-            if (first_hdr.empty()) {
-                first_hdr = hdr;
-            }
-
-            astro::wcs w = astro::wcs(hdr);
-            vec1u dims = iimg.image_dims();
-
-            double dxc, dyc;
-            astro::ad2xy(w, ra, dec, dxc, dyc);
-            dxc -= 1.0; dyc -= 1.0;
-            int_t xc = round(dxc);
-            int_t yc = round(dyc);
-            int_t iy0 = yc-hs, iy1 = yc+hs, ix0 = xc-hs, ix1 = xc+hs;
-
-            if (ix1 < 0 || ix0 >= int_t(dims[1]) || iy1 < 0 || iy0 >= int_t(dims[0])) {
-                // Source not covered
-                continue;
-            }
-
-            vec2d data;
-            if (ix0 < 0 || ix1 >= int_t(dims[1]) || iy0 < 0 || iy1 >= int_t(dims[0])) {
-                // Source partially covered
-                data = replicate(dnan, 2*hs+1, 2*hs+1);
-
-                uint_t tx0 = max(0, ix0);
-                uint_t ty0 = max(0, iy0);
-                uint_t tx1 = min(dims[1]-1, ix1);
-                uint_t ty1 = min(dims[0]-1, iy1);
-
-                vec2d subcut;
-                iimg.read_subset(subcut, ty0-_-ty1, tx0-_-tx1);
-
-                uint_t x0 = int_t(tx0)-ix0, x1 = int_t(tx1)-ix0, y0 = int_t(ty0)-iy0, y1 = int_t(ty1)-iy0;
-                data(y0-_-y1,x0-_-x1) = std::move(subcut);
-            } else {
-                // Source fully covered
-                int_t y0 = iy0, y1 = iy1, x0 = ix0, x1 = ix1;
-                iimg.read_subset(data, y0-_-y1, x0-_-x1);
-            }
-
-            if (img.data.empty()) {
-                // First image on which this source is found
-                img.data = std::move(data);
-
-                // Initialize WCS
-                img.hdr = astro::filter_wcs(hdr);
-
-                // Save precise center
-                px = hs+1+(dxc-xc);
-                py = hs+1+(dyc-yc);
-            } else {
-                // This source was found on another image, combine the two
-                vec1u idb = where(!is_finite(img.data));
-                img.data[idb] = data[idb];
-            }
+        cutout_extractor ex;
+        ex.setup_image(img.source.filename);
+        if (!img.source.distortfile.empty()) {
+            ex.setup_distortion(img.source.distortfile);
         }
 
-        if (img.data.empty()) {
-            // Source not covered, just use placeholder data
-            img.data = replicate(dnan, 2*hs+1, 2*hs+1);
-            img.hdr = astro::filter_wcs(first_hdr);
-        }
-
-        // Set cutout WCS
-        if (!fits::setkey(img.hdr, "NAXIS1", img.data.dims[1]) ||
-            !fits::setkey(img.hdr, "NAXIS2", img.data.dims[0]) ||
-            !fits::setkey(img.hdr, "CRPIX1", px) || !fits::setkey(img.hdr, "CRPIX2", py) ||
-            !fits::setkey(img.hdr, "CRVAL1", ra) || !fits::setkey(img.hdr, "CRVAL2", dec)) {
-            write_warning("could not set WCS information (CRPIX1, CRPIX2, CRVAL1, CRVAL2)");
-            write_warning("WCS for the cutout will be wrong");
-            write_warning("parsing '"+img.source.short_name+"'");
-        }
-
+        ex.get_cutout(img.data, img.hdr, ra, dec, opts.cutout_size);
         img.wcs = astro::wcs(img.hdr);
 
         if (!opts.nocuts) {

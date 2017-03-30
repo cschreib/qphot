@@ -4,6 +4,7 @@ struct image_source_t {
     std::string short_name;
     std::string band;
     std::string psffile;
+    std::string distortfile;
     double seeing = dnan;
     double zero_point = 23.9;
     bool nodetect = false;
@@ -81,6 +82,14 @@ bool read_image_source_list(const std::string& filename, vec<1,image_source_t>& 
                         cimg->psffile = val;
                     } else {
                         cimg->psffile = idir+val;
+                    }
+                }
+            } else if (key == "distortion") {
+                if (!val.empty()) {
+                    if (val[0] == '/') {
+                        cimg->distortfile = val;
+                    } else {
+                        cimg->distortfile = idir+val;
                     }
                 }
             } else if (key == "aperture") {
