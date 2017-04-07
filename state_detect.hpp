@@ -88,14 +88,18 @@ void state_t::build_detection_image() {
         }
 
         // Check the content of the image
-        double fzero = fraction_of(img.data == 0);
+        // Mask portions of image only containing 0s (only if larger than 4 adjacent pixels)
+        segment_output sdo;
+        vec2u segz = segment(img.data == 0, sdo);
+        foreach_segment(segz, sdo.origin, [&](uint_t is, vec1u ids) {
+            if (sdo.area[is] > 4) {
+                img.data[ids] = dnan;
+            }
+        });
+
+        // Check fraction of non finite pixels
         double fnfin = fraction_of(!is_finite(img.data));
-        if (fzero > 0.4) {
-            write_warning("ignoring image '", img.source.short_name, "' because it contains ",
-                round(fzero*100), "% of zero values");
-            img.data[_] = dnan;
-            img.covered = false;
-        } else if (fnfin > 0.4) {
+        if (fnfin > 0.4) {
             write_warning("ignoring image '", img.source.short_name, "' because it contains ",
                 round(fnfin*100), "% of invalid values");
             img.data[_] = dnan;
