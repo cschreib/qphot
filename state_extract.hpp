@@ -3,11 +3,11 @@ void get_background_apertures(const vec2b& mask, double radius, vec1u& y, vec1u&
     x.clear();
 
     // First segment the mask
-    uint_t nseg = 0;
-    vec2u seg = segment(mask, nseg);
+    segment_output sdo;
+    vec2u seg = segment(mask, sdo);
 
     // Add segments at the edges
-    seg(0,_) = seg(seg.dims[0]-1,_) = seg(_,0) = seg(_,seg.dims[1]-1) = nseg+1;
+    seg(0,_) = seg(seg.dims[0]-1,_) = seg(_,0) = seg(_,seg.dims[1]-1) = max(sdo.id)+1;
 
     // Build distance from segments
     vec2d dist;
@@ -38,8 +38,7 @@ void get_background_apertures(const vec2b& mask, double radius, vec1u& y, vec1u&
                     if (dist.safe(tty,ttx) == 0) return;
 
                     if (dist_id.safe(ty,tx) == mid) {
-                        double nd = sqr(double(tty) - y.back())
-                                  + sqr(double(ttx) - x.back());
+                        double nd = sqr(double(tty) - y.back()) + sqr(double(ttx) - x.back());
 
                         if (nd < radius2) {
                             // Still within the circle, move on
