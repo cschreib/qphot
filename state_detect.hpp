@@ -342,6 +342,7 @@ void state_t::build_detection_image() {
                 vec1u idb = where(!is_finite(tdata));
                 tdata[idb] = 0;
                 tdata = convolve2d(tdata, kernel);
+                tdata[idb] = dnan;
 
                 idb = where(!is_finite(tpsf));
                 tpsf[idb] = 0;
@@ -369,10 +370,9 @@ void state_t::build_detection_image() {
         // Build stacked image and add it to the cube
         vec2d stack; {
             vec1d wei = 1/sqr(im_rms);
-            double twei = total(wei);
-
             stack = reduce(2, cube, [&](vec1d v) {
-                return total(v*wei)/twei;
+                vec1u idf = where(is_finite(v));
+                return total(v[idf]*wei[idf])/total(wei[idf]);
             });
 
             double md;
