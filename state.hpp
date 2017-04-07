@@ -109,6 +109,11 @@ struct state_t {
     fits::header det_psf_hdr;
     bool has_clean = false;
     bool has_homogenize = false;
+    bool has_filters = false;
+    uint_t isource = npos;
+    vec2d det_model;
+    segment_deblend_output segments;
+    vec2u seg;
 
     state_t(const vec<1,image_source_t>& sources, const options_t& o) : opts(o) {
         images.data.reserve(sources.size());
@@ -176,14 +181,40 @@ struct state_t {
     void read_psfs();
     // state_detect.hpp
     void build_detection_image();
+    // state_filters.hpp
+    void apply_filters();
     // state_clean.hpp
     void clean_images();
     // state_extract.hpp
     void extract_fluxes();
 };
 
+vec2d make_point_source_integer(const vec2d& psf, const std::array<uint_t,2>& dims, int_t y, int_t x) {
+    vec2d model(dims);
+    int_t y0 = max(0, y - int_t(psf.dims[0]/2));
+    int_t y1 = min(int_t(dims[0]), y + int_t(psf.dims[0]/2+1));
+    int_t x0 = max(0, x - int_t(psf.dims[1]/2));
+    int_t x1 = min(int_t(dims[0]), x + int_t(psf.dims[1]/2+1));
+
+    for (int_t iy = y0; iy < y1; ++iy)
+    for (int_t ix = x0; ix < x1; ++ix) {
+        int_t ipy = iy - y + int_t(psf.dims[0]/2);
+        int_t ipx = ix - x + int_t(psf.dims[1]/2);
+        model.safe(uint_t(iy),uint_t(ix)) = psf.safe(uint_t(ipy),uint_t(ipx));
+    }
+
+    return model;
+}
+
+vec2d make_point_source(const vec2d& psf, const std::array<uint_t,2>& dims, double y, double x) {
+    int_t iy = round(y), ix = round(x);
+    vec2d npsf = translate(psf, y - iy, x - ix);
+    return make_point_source_integer(npsf, dims, iy, ix);
+}
+
 #include "state_image.hpp"
 #include "state_cutouts.hpp"
 #include "state_detect.hpp"
+#include "state_filters.hpp"
 #include "state_clean.hpp"
 #include "state_extract.hpp"

@@ -116,6 +116,9 @@ void state_t::build_detection_image() {
             if (!img.source.noconvolve) {
                 has_homogenize = true;
             }
+            if (img.source.background_box > 0) {
+                has_filters = true;
+            }
             if (img.source.hri) {
                 hri.push_back(&img);
             }
@@ -397,6 +400,176 @@ void state_t::build_detection_image() {
             oimg.reach_hdu(2);
             oimg.write(det_psf);
             oimg.write_header(det_psf_hdr);
+        }
+    }
+
+    if (has_clean || has_filters) {
+        if (opts.verbose) {
+            note("cleaning detection image...");
+        }
+
+        det_model.resize(det_img.dims);
+        vec2d det_img_clean; {
+            vec2d tdimg = det_img;
+            uint_t mid = max_id(det_img);
+            uint_t iter = 0;
+
+            vec2d clean_psf = det_psf;
+            clean_psf /= max(clean_psf);
+
+            while (tdimg[mid] > opts.clean_threshold) {
+                vec1i ids = mult_ids(tdimg, mid);
+                vec2d tpsf = make_point_source_integer(clean_psf, tdimg.dims, ids[0], ids[1]);
+
+                if (opts.debug_clean && iter % 20 == 0) {
+                    print("clean ", iter, ": max ", tdimg[mid], " pos: ", ids);
+                    if (iter % 100 == 0) {
+                        fits::write("debug_clean.fits", tdimg);
+                    }
+                }
+
+                double flx = tdimg[mid]*opts.clean_ratio;
+                tdimg -= tpsf*flx;
+                det_model[mid] += flx;
+
+                mid = max_id(tdimg);
+
+                ++iter;
+            }
+
+            det_model[where(det_model > 0)] += opts.clean_threshold;
+
+            double clean_conv_seeing = opts.clean_conv_seeing;
+            if (!is_finite(clean_conv_seeing)) {
+                clean_conv_seeing = 0.66*det_seeing;
+            }
+
+            vec2d model_psf = gaussian_profile(det_img.dims,
+                clean_conv_seeing/2.355/det_aspix, det_img.dims[0]/2, det_img.dims[1]/2
+            );
+
+            model_psf /= max(model_psf);
+
+            det_img_clean = convolve2d(det_model, model_psf);
+
+            det_model[where(det_model > 0)] -= opts.clean_threshold;
+
+            if (!opts.nocuts) {
+                fits::output_image oimg(outdir+"detection_image_cleaned.fits");
+                oimg.reach_hdu(1);
+                oimg.write(det_img_clean);
+                oimg.write_header(det_hdr);
+                oimg.write_keyword("CRATIO", opts.clean_ratio);
+                oimg.write_keyword("CTHRESH", opts.clean_threshold);
+                oimg.write_keyword("CSEING", clean_conv_seeing);
+
+                oimg.reach_hdu(2);
+                oimg.write(det_model);
+                oimg.write_header(det_hdr);
+            }
+        }
+
+        if (opts.verbose) {
+            note("building segmentation map...");
+        }
+
+        segment_deblend_params sdp;
+        sdp.detect_threshold = opts.det_threshold;
+        sdp.deblend_threshold = 0.5*det_seeing/det_aspix;
+        sdp.min_area = opts.det_min_area;
+        seg = segment_deblend(det_img_clean, segments, sdp);
+
+        {
+            // Search among the detected segment for a source close to the center
+            double bestd = finf;
+            for (uint_t i : range(segments.id)) {
+                double d = sqr(segments.bx[i] - int_t(seg.dims[1]/2)) +
+                           sqr(segments.by[i] - int_t(seg.dims[0]/2));
+                if (d < bestd) {
+                    bestd = d;
+                    isource = i;
+                }
+            }
+
+            if (bestd > sqr(search_radius/det_aspix)) {
+                write_warning("the target source was not found in the detection image");
+                write_warning("(the closest source was found at ", sqrt(bestd)*det_aspix, " arcsec)");
+                write_warning("it will be added as a central point source for the fitting stage");
+
+                isource = segments.bx.size();
+                segments.id.push_back(max(segments.id)+1);
+                segments.px.push_back(det_img.dims[1]/2);
+                segments.py.push_back(det_img.dims[0]/2);
+                segments.bx.push_back(segments.px.back());
+                segments.by.push_back(segments.py.back());
+                segments.origin.push_back(flat_id(seg, segments.py.back(), segments.px.back()));
+
+                // Need to assign the source a segmentation area, let's use half the search radius
+                vec1u idc = where(circular_mask(det_model.dims,
+                    0.5*search_radius/det_aspix, segments.py.back(), segments.px.back()) > 0.5);
+
+                // Create segmentation in empty space
+                segments.area.push_back(idc.size());
+                segments.flux.push_back(total(det_img_clean[idc]));
+                det_model[idc] = 0;
+                det_model(segments.py.back(), segments.px.back()) = 1.0;
+
+                // Make sure the neigboring sources are shrunk accordingly
+                vec1u old_areas = segments.area;
+                segments.bx *= segments.area;
+                segments.by *= segments.area;
+                for (uint_t i : idc) {
+                    if (seg[i] != 0) {
+                        uint_t is = where_first(segments.id == seg[i]);
+                        if (is != npos) {
+                            vec1u tp = mult_ids(seg, i);
+                            segments.area[is] -= 1;
+                            segments.bx[is] -= tp[1];
+                            segments.by[is] -= tp[0];
+                            segments.flux[is] -= det_img_clean[i];
+                        }
+                    }
+                }
+
+                // Erase segments that became too small
+                vec1u toerase = where((segments.area < opts.det_min_area || segments.area == 0) &&
+                    segments.id != segments.id.back());
+                inplace_remove(segments.id,     toerase);
+                inplace_remove(segments.px,     toerase);
+                inplace_remove(segments.py,     toerase);
+                inplace_remove(segments.bx,     toerase);
+                inplace_remove(segments.by,     toerase);
+                inplace_remove(segments.origin, toerase);
+                inplace_remove(segments.area,   toerase);
+                inplace_remove(segments.flux,   toerase);
+
+                // Update remaining shrunk segments
+                segments.bx /= segments.area;
+                segments.by /= segments.area;
+                for (uint_t is : where(segments.area != old_areas)) {
+                    vec1u ids = where(seg == segments.id[is]);
+                    segments.origin[is] = max_id(det_model[ids]);
+                    vec1u tp = mult_ids(seg, segments.origin[is]);
+                    segments.px[is] = tp[1];
+                    segments.py[is] = tp[0];
+                }
+
+                // Assign segmentation of new source
+                seg[idc] = segments.id.back();
+            }
+        }
+
+        if (opts.verbose) {
+            note("found ", segments.id.size(), " segments in the detection image");
+        }
+
+        // Save segmentation map
+        if (!opts.nocuts) {
+            fits::write(outdir+"segmentation.fits", seg, det_hdr);
+            fits::write_table(outdir+"segmentation_catalog.fits", ftable(
+                segments.id, segments.px, segments.py, segments.bx, segments.by, segments.area,
+                segments.origin, segments.flux
+            ));
         }
     }
 }

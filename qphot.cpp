@@ -227,6 +227,7 @@ int phypp_main(int argc, char* argv[]) {
             st.extract_cutouts(ora[i], odec[i]);
             st.read_psfs();
             st.build_detection_image();
+            st.apply_filters();
             st.clean_images();
             st.extract_fluxes();
 
@@ -368,6 +369,7 @@ int phypp_main(int argc, char* argv[]) {
         st.read_cutouts();
         st.read_psfs();
         st.build_detection_image();
+        st.apply_filters();
         st.clean_images();
         st.extract_fluxes();
 

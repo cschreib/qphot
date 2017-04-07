@@ -9,6 +9,7 @@ struct image_source_t {
     double zero_point = 23.9;
     bool nodetect = false;
     double aperture = dnan;
+    double background_box = dnan;
     bool clean_neighbors = false;
     bool noconvolve = false;
     bool nodance = false;
@@ -96,6 +97,12 @@ bool read_image_source_list(const std::string& filename, vec<1,image_source_t>& 
             } else if (key == "aperture") {
                 if (!from_string(val, cimg->aperture)) {
                     error("could not read 'aperture' value from '", val, "'");
+                    error("at ", filename, ":", l);
+                    return false;
+                }
+            } else if (key == "background_box") {
+                if (!from_string(val, cimg->background_box)) {
+                    error("could not read 'background_box' value from '", val, "'");
                     error("at ", filename, ":", l);
                     return false;
                 }
