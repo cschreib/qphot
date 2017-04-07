@@ -116,9 +116,8 @@ void state_t::extract_fluxes() {
 
         // Flag center of image where the source is, just in case it didn't make it into
         // the detection image
-        vec2b center(det_img.dims);
-        // TODO: fix this which does not take into account extents of the central source
-        center(det_img.dims[0]/2, det_img.dims[1]/2) = true;
+        vec2b center = circular_mask(det_img.dims, max(det_seeing, img.seeing)/2.0/det_aspix,
+            det_img.dims[0]/2, det_img.dims[1]/2) > 0.2;
 
         if (opts.no_neighbor_mask_background || img.source.no_neighbor_mask_background) {
             get_background_apertures(center || !is_finite(rdata), min_dist, by, bx);
@@ -136,11 +135,9 @@ void state_t::extract_fluxes() {
                 }
 
                 if (by.size() < opts.min_bg_aper) {
-                    write_warning("could place only ", by.size()," background apertures below ", threshold, " sigma");
-                    threshold += 0.5;
-                    write_warning("trying again without masking neighbors");
-
                     // Try without masking neighbors, just the central source
+                    write_warning("could place only ", by.size()," background apertures below ", threshold, " sigma");
+                    write_warning("trying again without masking neighbors");
                     get_background_apertures(center || !is_finite(rdata), min_dist, by, bx);
                 }
             }
