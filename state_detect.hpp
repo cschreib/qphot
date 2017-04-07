@@ -30,12 +30,20 @@ void state_t::build_detection_image() {
         }
 
         // Mask bad pixels if asked
-        std::string bad_file = file::remove_extension(img.source.filename)+"-bad.reg";
+
+        // From DS9 region files
+        std::string bad_file = outdir+img.source.short_name+"-bad.reg";
         if (!file::exists(bad_file)) {
-            bad_file = file::remove_extension(img.source.filename)+"_bad.reg";
-            if (!file::exists(bad_file)) {
-                bad_file = "";
-            }
+            bad_file = outdir+img.source.short_name+"_bad.reg";
+        }
+        if (!file::exists(bad_file)) {
+            bad_file = img.source.short_name+"-bad.reg";
+        }
+        if (!file::exists(bad_file)) {
+            bad_file = img.source.short_name+"_bad.reg";
+        }
+        if (!file::exists(bad_file)) {
+            bad_file = "";
         }
 
         if (!bad_file.empty()) {
@@ -54,6 +62,29 @@ void state_t::build_detection_image() {
             }
 
             img.data[where(bad_mask > 0.5)] = dnan;
+        }
+
+        // From FITS mask
+        bad_file = outdir+img.source.short_name+"-bad.fits";
+        if (!file::exists(bad_file)) {
+            bad_file = outdir+img.source.short_name+"_bad.fits";
+        }
+        if (!file::exists(bad_file)) {
+            bad_file = img.source.short_name+"-bad.fits";
+        }
+        if (!file::exists(bad_file)) {
+            bad_file = img.source.short_name+"_bad.fits";
+        }
+        if (!file::exists(bad_file)) {
+            bad_file = "";
+        }
+
+        if (!bad_file.empty()) {
+            vec2b bad;
+            fits::read(bad_file, bad);
+            if (bad.dims == img.data.dims) {
+                img.data[where(bad)] = dnan;
+            }
         }
 
         // Check the content of the image
