@@ -6,6 +6,14 @@ void state_t::extract_cutouts(double ra, double dec) {
     }
 
     for (auto& img : images) {
+        if (opts.reuse_cutouts && file::exists(outdir+img.source.short_name+".fits")) {
+            fits::input_image iimg(outdir+img.source.short_name+".fits");
+            iimg.read(img.data);
+            img.hdr = iimg.read_header();
+            img.wcs = astro::wcs(img.hdr);
+            continue;
+        }
+
         cutout_extractor ex;
         ex.setup_image(img.source.filename);
         if (!img.source.distortfile.empty()) {

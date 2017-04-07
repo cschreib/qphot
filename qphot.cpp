@@ -8,9 +8,9 @@ int phypp_main(int argc, char* argv[]) {
 
     read_args(argc-1, argv+1, arg_list(
         opts.aperture, opts.outdir, opts.verbose, opts.exclude, opts.include, opts.det_seeing,
-        opts.error_file, opts.min_bg_aper, opts.clean_model, opts.reuse, opts.clean_ratio,
-        opts.clean_threshold, opts.clean_conv_seeing, opts.clean_group, opts.model_dance,
-        opts.dance_step, opts.dance_max, opts.dance_chi2_range, opts.det_min_area,
+        opts.error_file, opts.min_bg_aper, opts.clean_model, opts.reuse, opts.reuse_cutouts,
+        opts.clean_ratio, opts.clean_threshold, opts.clean_conv_seeing, opts.clean_group,
+        opts.model_dance, opts.dance_step, opts.dance_max, opts.dance_chi2_range, opts.det_min_area,
         opts.debug_clean, opts.no_neighbor_mask_background, opts.save_models, opts.det_threshold,
         opts.bg_threshold, opts.hri_min_snr, opts.extra, opts.nocuts, opts.priors, opts.cutout_size,
         opts.show_progress, opts.save_interval, opts.threads, opts.merge, opts.search_radius

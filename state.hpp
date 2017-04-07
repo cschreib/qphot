@@ -18,6 +18,7 @@ struct options_t {
     uint_t min_bg_aper = 10;
     bool no_neighbor_mask_background = false;
     bool reuse = false;
+    bool reuse_cutouts = false;
     std::string clean_model = "clean";
     double clean_ratio = 0.1;
     double clean_threshold = 3.0;
