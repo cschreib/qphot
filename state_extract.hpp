@@ -122,7 +122,11 @@ void state_t::extract_fluxes() {
         if (opts.no_neighbor_mask_background || img.source.no_neighbor_mask_background) {
             get_background_apertures(center || !is_finite(rdata), min_dist, by, bx);
         } else {
-            get_background_apertures(det_img > threshold || center || !is_finite(rdata), min_dist, by, bx);
+            segment_output sdo;
+            segment_params sdp;
+            sdp.min_area = 4;
+            vec2b exclude = segment(det_img > threshold, sdo, sdp) > 0;
+            get_background_apertures(exclude || center || !is_finite(rdata), min_dist, by, bx);
 
             if (by.size() < opts.min_bg_aper) {
                 uint_t ntry = 0;
@@ -130,8 +134,9 @@ void state_t::extract_fluxes() {
                     ++ntry;
                     write_warning("could place only ", by.size()," background apertures below ", threshold, " sigma");
                     threshold += 0.5;
+                    exclude = segment(det_img > threshold, sdo, sdp) > 0;
                     write_warning("trying again with a threshold of ", threshold, " sigma");
-                    get_background_apertures(det_img > threshold || center || !is_finite(rdata), min_dist, by, bx);
+                    get_background_apertures(exclude || center || !is_finite(rdata), min_dist, by, bx);
                 }
 
                 if (by.size() < opts.min_bg_aper) {
