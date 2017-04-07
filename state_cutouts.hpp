@@ -87,9 +87,19 @@ void state_t::read_psfs() {
     for (auto& img : images) {
         auto& idims = img.data.dims;
 
-        if (!img.source.psffile.empty()) {
+        // Locate PSF file, using local file to override global setting
+        std::string psf_file;
+        psf_file = outdir+img.source.short_name+"-psf.fits";
+        if (!file::exists(psf_file)) {
+            psf_file = outdir+img.source.short_name+"_psf.fits";
+        }
+        if (!file::exists(psf_file)) {
+            psf_file = img.source.psffile;
+        }
+
+        if (!psf_file.empty()) {
             // Read the PSF
-            fits::read(img.source.psffile, img.psf);
+            fits::read(psf_file, img.psf);
 
             // Make sure the PSF is centered
             vec1i idm = mult_ids(img.psf, max_id(img.psf));
