@@ -120,7 +120,7 @@ void state_t::extract_fluxes() {
         // TODO: fix this which does not take into account extents of the central source
         center(det_img.dims[0]/2, det_img.dims[1]/2) = true;
 
-        if (opts.no_neighbor_mask_background) {
+        if (opts.no_neighbor_mask_background || img.source.no_neighbor_mask_background) {
             get_background_apertures(center || !is_finite(rdata), min_dist, by, bx);
         } else {
             get_background_apertures(det_img > threshold || center || !is_finite(rdata), min_dist, by, bx);

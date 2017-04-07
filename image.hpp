@@ -13,6 +13,7 @@ struct image_source_t {
     bool noconvolve = false;
     bool nodance = false;
     bool hri = false;
+    bool no_neighbor_mask_background = false;
     std::string flux_method = "none";
 
     // Static variables
@@ -107,6 +108,12 @@ bool read_image_source_list(const std::string& filename, vec<1,image_source_t>& 
             } else if (key == "clean_neighbors") {
                 if (!from_string(val, cimg->clean_neighbors)) {
                     error("could not read 'clean_neighbors' value from '", val, "'");
+                    error("at ", filename, ":", l);
+                    return false;
+                }
+            } else if (key == "no_neighbor_mask_background") {
+                if (!from_string(val, cimg->no_neighbor_mask_background)) {
+                    error("could not read 'no_neighbor_mask_background' value from '", val, "'");
                     error("at ", filename, ":", l);
                     return false;
                 }
