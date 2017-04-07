@@ -37,6 +37,10 @@ struct options_t {
     uint_t save_interval = 0;
     uint_t threads = 1;
     bool merge = false;
+    bool update = false;
+    double prior_ra = dnan;
+    double prior_dec = dnan;
+    vec1s only_sources;
 };
 
 struct image_t {

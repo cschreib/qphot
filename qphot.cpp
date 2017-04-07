@@ -13,7 +13,8 @@ int phypp_main(int argc, char* argv[]) {
         opts.model_dance, opts.dance_step, opts.dance_max, opts.dance_chi2_range, opts.det_min_area,
         opts.debug_clean, opts.no_neighbor_mask_background, opts.save_models, opts.det_threshold,
         opts.bg_threshold, opts.hri_min_snr, opts.extra, opts.nocuts, opts.priors, opts.cutout_size,
-        opts.show_progress, opts.save_interval, opts.threads, opts.merge, opts.search_radius
+        opts.show_progress, opts.save_interval, opts.threads, opts.merge, opts.update,
+        opts.search_radius, opts.prior_ra, opts.prior_dec, opts.only_sources
     ));
 
     if (opts.clean_model != "psf" && opts.clean_model != "hri" &&
@@ -86,12 +87,34 @@ int phypp_main(int argc, char* argv[]) {
         return 1;
     }
 
+
+    vec1s osid;
+    vec1d ora, odec;
+    vec1u oid;
+
     if (!opts.priors.empty()) {
-        // Read a set of positions from a catalog and extract cutouts on the fly
-        vec1s osid;
-        vec1d ora, odec;
         fits::read_table(opts.priors, "sid", osid, "ra", ora, "dec", odec);
 
+        oid = replicate(npos, osid.size());
+
+        if (!opts.only_sources.empty()) {
+            vec1u id1, id2;
+            match(osid, opts.only_sources, id1, id2);
+
+            osid = osid[id1];
+            ora = ora[id1];
+            odec = odec[id1];
+            oid = oid[id1];
+        }
+    } else if (is_finite(opts.prior_ra) && is_finite(opts.prior_dec)) {
+        osid = {""};
+        ora = {opts.prior_ra};
+        odec = {opts.prior_dec};
+        oid = {npos};
+    }
+
+    if (!osid.empty()) {
+        // Extract cutouts on the fly
         vec1s sid;
         vec1d ra, dec;
         vec2f flux, flux_err, apcor, background;
@@ -102,7 +125,7 @@ int phypp_main(int argc, char* argv[]) {
         vec1u eazy_bands;
         vec1f lambda;
 
-        if (opts.merge) {
+        if ((opts.merge || opts.update) && file::exists(opts.outdir+"fluxes.fits")) {
             fits::read_table(opts.outdir+"fluxes.fits", ftable(
                 sid, ra, dec, flux, flux_err, apcor, background, num_bg,
                 imgfile, bands, lambda, eazy_bands
@@ -115,12 +138,28 @@ int phypp_main(int argc, char* argv[]) {
             vec1u id1, id2;
             match(osid, sid, id1, id2);
 
-            inplace_remove(osid, id1);
-            inplace_remove(ora, id1);
-            inplace_remove(odec, id1);
+            if (opts.merge) {
+                inplace_remove(osid, id1);
+                inplace_remove(ora, id1);
+                inplace_remove(odec, id1);
+                inplace_remove(oid, id1);
 
-            if (opts.verbose) {
-                note("will analyze ", osid.size(), " new sources");
+                if (opts.verbose) {
+                    note("will analyze ", osid.size(), " new sources");
+                }
+            } else if (opts.update) {
+                oid[id1] = id2;
+
+                if (opts.verbose) {
+                    if (osid.size() - id1.size() > 0 && !id1.empty()) {
+                        note("will analyze ", osid.size() - id1.size(), " new sources and update ",
+                            id1.size(), " sources");
+                    } else if (id1.empty()) {
+                        note("will analyze ", osid.size(), " new sources");
+                    } else {
+                        note("will update ", id1.size(), " sources");
+                    }
+                }
             }
         } else {
             if (opts.verbose) {
@@ -133,6 +172,14 @@ int phypp_main(int argc, char* argv[]) {
                 lambda.push_back(img.lambda);
                 eazy_bands.push_back(img.eazy_band);
             }
+        }
+
+        if (ora.empty()) {
+            if (opts.verbose) {
+                note("no source to analyze");
+            }
+
+            return 0;
         }
 
         auto save_catalog = [&]() {
@@ -163,7 +210,12 @@ int phypp_main(int argc, char* argv[]) {
 
             state_t st(image_sources, opts);
 
-            st.outdir = opts.outdir+osid[i]+"/";
+            if (osid[i] != "") {
+                st.outdir = opts.outdir+osid[i]+"/";
+            } else {
+                st.outdir = opts.outdir;
+            }
+
             if (!opts.nocuts) {
                 file::mkdir(st.outdir);
             }
@@ -194,14 +246,29 @@ int phypp_main(int argc, char* argv[]) {
         auto save_source = [&](output_t o) {
             uint_t nimg = o.flux.size();
 
-            sid.push_back(osid[o.id]);
-            ra.push_back(ora[o.id]);
-            dec.push_back(odec[o.id]);
-            append<0>(flux,       reform(std::move(o.flux),       1,     nimg));
-            append<0>(flux_err,   reform(std::move(o.flux_err),   1,     nimg));
-            append<0>(apcor,      reform(std::move(o.apcor),      1,     nimg));
-            append<0>(background, reform(std::move(o.background), 1,     nimg));
-            append<0>(num_bg,     reform(std::move(o.num_bg),     1,     nimg));
+            if (oid[o.id] == npos) {
+                // New source
+                sid.push_back(osid[o.id]);
+                ra.push_back(ora[o.id]);
+                dec.push_back(odec[o.id]);
+                append<0>(flux,       reform(std::move(o.flux),       1,     nimg));
+                append<0>(flux_err,   reform(std::move(o.flux_err),   1,     nimg));
+                append<0>(apcor,      reform(std::move(o.apcor),      1,     nimg));
+                append<0>(background, reform(std::move(o.background), 1,     nimg));
+                append<0>(num_bg,     reform(std::move(o.num_bg),     1,     nimg));
+            } else {
+                // Update source
+                uint_t j = oid[o.id];
+                sid[j] = osid[o.id];
+                ra[j] = ora[o.id];
+                dec[j] = odec[o.id];
+                flux(j,_) = o.flux;
+                flux_err(j,_) = o.flux_err;
+                apcor(j,_) = o.apcor;
+                background(j,_) = o.background;
+                num_bg(j,_) = o.num_bg;
+            }
+
             saved = false;
 
             if (opts.save_interval != 0 &&
@@ -211,9 +278,19 @@ int phypp_main(int argc, char* argv[]) {
             }
         };
 
+        if (ora.size() < opts.threads) {
+            if (opts.verbose) {
+                note("only ", ora.size(), " sources will be extracted, reducing the number of "
+                    "threads");
+            }
+
+            opts.threads = ora.size();
+        }
+
         if (opts.threads == 1) {
             auto pg = progress_start(osid.size());
             for (uint_t i : range(osid)) {
+                if (opts.verbose) note("processing source ", osid[i]);
                 save_source(process_source(i));
                 if (opts.show_progress) progress(pg);
             }
