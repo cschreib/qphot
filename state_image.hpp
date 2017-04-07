@@ -78,7 +78,10 @@ void state_t::regrid(image_t& img) {
 }
 
 void state_t::convolve_to(image_t& img, double new_seeing) {
-    if (new_seeing <= img.seeing) return;
+    if (new_seeing <= img.seeing) {
+        img.convolved = true;
+        return;
+    }
 
     img.conv_radius = sqrt(sqr(new_seeing) - sqr(img.seeing))/2.355/img.regridded_aspix;
 
